@@ -41,6 +41,9 @@ EX: `vllm serve deepseek-ai/DeepSeek-V2-Lite --trust-remote-code --data-parallel
 
 Note that there must be at least two GPUs visible in `CUDA_VISIBLE_DEVICES`
 
+For commands that compare serving throughput with DBO disabled and enabled,
+see [Benchmarking MoE Dual Batch Overlap](../benchmarking/moe_dbo.md).
+
 ## DBO Components
 
 * GPUModelRunner

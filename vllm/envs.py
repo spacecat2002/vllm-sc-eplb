@@ -46,6 +46,15 @@ if TYPE_CHECKING:
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
+    VLLM_MOE_TRACE_DIR: str | None = None
+    VLLM_MOE_TRACE_MAX_STEPS: int = 1
+    VLLM_MOE_TRACE_MODE: str = "lora_training"
+    VLLM_DEEPEP_HT_PROFILE: bool = False
+    VLLM_DEEPEP_HT_PROFILE_LOG: bool = True
+    VLLM_DEEPEP_HT_PROFILE_WARMUP: int = 10
+    VLLM_DEEPEP_HT_PROFILE_SAMPLES: int = 100
+    VLLM_SC_EPLB: bool = False
+    VLLM_SC_EPLB_LORA_DIR: str | None = None
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -836,6 +845,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, vllm will trace function calls
     # Useful for debugging
     "VLLM_TRACE_FUNCTION": lambda: int(os.getenv("VLLM_TRACE_FUNCTION", "0")),
+    # Opt-in research instrumentation for MoE routing and execution.
+    "VLLM_MOE_TRACE_DIR": lambda: os.getenv("VLLM_MOE_TRACE_DIR"),
+    "VLLM_MOE_TRACE_MAX_STEPS": lambda: int(os.getenv("VLLM_MOE_TRACE_MAX_STEPS", "1")),
+    "VLLM_MOE_TRACE_MODE": lambda: os.getenv("VLLM_MOE_TRACE_MODE", "lora_training"),
+    "VLLM_DEEPEP_HT_PROFILE": lambda: bool(
+        int(os.getenv("VLLM_DEEPEP_HT_PROFILE", "0"))
+    ),
+    "VLLM_DEEPEP_HT_PROFILE_LOG": lambda: bool(
+        int(os.getenv("VLLM_DEEPEP_HT_PROFILE_LOG", "1"))
+    ),
+    "VLLM_DEEPEP_HT_PROFILE_WARMUP": lambda: int(
+        os.getenv("VLLM_DEEPEP_HT_PROFILE_WARMUP", "10")
+    ),
+    "VLLM_DEEPEP_HT_PROFILE_SAMPLES": lambda: int(
+        os.getenv("VLLM_DEEPEP_HT_PROFILE_SAMPLES", "100")
+    ),
+    "VLLM_SC_EPLB": lambda: os.getenv("VLLM_SC_EPLB", "0").strip().lower()
+    in ("1", "true", "on", "yes"),
+    "VLLM_SC_EPLB_LORA_DIR": lambda: os.getenv("VLLM_SC_EPLB_LORA_DIR"),
     # Whether to use the FlashInfer top-k / top-p sampler on CUDA. Enabled
     # by default when the hardware supports it — set to 0 to opt out
     # explicitly, which forces the PyTorch-native (Triton for bs>=8) path.
@@ -2152,6 +2180,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
+        "VLLM_MOE_TRACE_DIR",
+        "VLLM_MOE_TRACE_MAX_STEPS",
+        "VLLM_MOE_TRACE_MODE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",

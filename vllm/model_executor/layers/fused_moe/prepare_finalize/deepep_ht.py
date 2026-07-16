@@ -1,11 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable
+import json
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from itertools import count
+from typing import Any
 
 import deep_ep
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import envs
+from vllm.distributed import get_ep_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
@@ -24,6 +33,40 @@ from vllm.v1.worker.ubatching import (
     dbo_yield_and_switch_from_comm_to_compute,
     dbo_yield_and_switch_from_compute_to_comm,
 )
+
+logger = init_logger(__name__)
+_profile_instance_counter = count()
+
+
+@dataclass
+class _DeepEPHTProfileSample:
+    sample_id: int
+    timings_ms: dict[str, float] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@contextmanager
+def _profile_phase(
+    sample: _DeepEPHTProfileSample | None,
+    name: str,
+) -> Iterator[None]:
+    if sample is None:
+        yield
+        return
+
+    torch.accelerator.synchronize()
+    start_ns = time.perf_counter_ns()
+    try:
+        yield
+    finally:
+        torch.accelerator.synchronize()
+        sample.timings_ms[name] = (time.perf_counter_ns() - start_ns) / 1e6
+
+
+def _profile_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    return value
 
 
 class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -70,6 +113,54 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # From https://github.com/deepseek-ai/DeepEP/blob/9fe9021f29c9083cd1808ab36b740208524d9f63/deep_ep/buffer.py#L164
         self.available_rank_configs = [2, 4, 8, 16, 24, 32, 64, 128, 144, 160]
 
+        self._profile_enabled = envs.VLLM_DEEPEP_HT_PROFILE
+        self._profile_log_enabled = envs.VLLM_DEEPEP_HT_PROFILE_LOG
+        self._profile_instance = next(_profile_instance_counter)
+        self._profile_warmup = envs.VLLM_DEEPEP_HT_PROFILE_WARMUP
+        self._profile_num_samples = envs.VLLM_DEEPEP_HT_PROFILE_SAMPLES
+        if self._profile_warmup < 0 or self._profile_num_samples < 0:
+            raise ValueError(
+                "VLLM_DEEPEP_HT_PROFILE_WARMUP and "
+                "VLLM_DEEPEP_HT_PROFILE_SAMPLES must be non-negative"
+            )
+        self._profile_iteration = 0
+        self._profile_samples: list[_DeepEPHTProfileSample | None] = [None, None]
+
+    def get_active_profile_sample(self) -> _DeepEPHTProfileSample | None:
+        """Return the sample being populated for the current ubatch."""
+        return self._profile_samples[dbo_current_ubatch_id()]
+
+    def _new_profile_sample(self) -> _DeepEPHTProfileSample | None:
+        if not self._profile_enabled:
+            return None
+
+        sample_id = self._profile_iteration
+        self._profile_iteration += 1
+        if sample_id < self._profile_warmup or sample_id >= (
+            self._profile_warmup + self._profile_num_samples
+        ):
+            return None
+        return _DeepEPHTProfileSample(sample_id=sample_id)
+
+    def _log_profile(self, op: str, sample: _DeepEPHTProfileSample | None) -> None:
+        if sample is None or not self._profile_log_enabled:
+            return
+        timings_ms = {
+            name: elapsed_ms
+            for name, elapsed_ms in sample.timings_ms.items()
+            if name.startswith(op)
+        }
+        payload = {
+            "op": op,
+            "rank": get_ep_group().rank_in_group,
+            "instance": self._profile_instance,
+            "sample": sample.sample_id,
+            "timings_ms": timings_ms,
+            "total_ms": sum(timings_ms.values()),
+            **sample.metadata,
+        }
+        logger.warning("DEEPEP_HT_PROFILE %s", json.dumps(payload, sort_keys=True))
+
     def _sync_dbo_comm_if_needed(self) -> None:
         if self.sync_dbo_comm and dbo_enabled():
             # ROCm DeepEP HT dispatch/combine reuse Buffer-owned communication
@@ -115,6 +206,24 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         defer_input_quant: bool,
     ) -> Callable:
         has_scales = token_scales is not None
+        a2a_idx = dbo_current_ubatch_id()
+        if self._profile_enabled and dbo_enabled():
+            raise RuntimeError(
+                "VLLM_DEEPEP_HT_PROFILE requires DBO to be disabled because "
+                "its device-wide synchronizations cannot isolate concurrent ubatches"
+            )
+        sample = self._new_profile_sample()
+        self._profile_samples[a2a_idx] = sample
+
+        if sample is not None:
+            sample.metadata.update(
+                input_tokens=tokens.shape[0],
+                hidden_size=tokens.shape[-1],
+                topk=rank_topk_ids.shape[-1],
+                dtype=str(tokens.dtype),
+                has_scales=has_scales,
+                num_experts=num_experts,
+            )
 
         # Capture a DeepEP event on the compute stream before yielding.
         # This must happen before the yield so the event only covers this
@@ -127,54 +236,67 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # for the other ubatch before the dispatch kernel starts.
         dbo_yield_and_switch_from_compute_to_comm()
 
-        (
-            num_tokens_per_rank,
-            num_tokens_per_rdma_rank,
-            dispatch_expert_num_tokens,
-            is_token_in_rank,
-            event,
-        ) = self.buffer.get_dispatch_layout(
-            topk_idx=rank_topk_ids,
-            num_experts=num_experts,
-            previous_event=previous_event,
-            async_finish=False,
-            allocate_on_comm_stream=False,
-        )
+        with _profile_phase(sample, "dispatch_layout"):
+            (
+                num_tokens_per_rank,
+                num_tokens_per_rdma_rank,
+                dispatch_expert_num_tokens,
+                is_token_in_rank,
+                event,
+            ) = self.buffer.get_dispatch_layout(
+                topk_idx=rank_topk_ids,
+                num_experts=num_experts,
+                previous_event=previous_event,
+                async_finish=False,
+                allocate_on_comm_stream=False,
+            )
+
+        if sample is not None:
+            sample.metadata.update(
+                send_tokens_per_rank=_profile_value(num_tokens_per_rank),
+                send_tokens_per_rdma_rank=_profile_value(num_tokens_per_rdma_rank),
+            )
 
         token_data = tokens
         if has_scales:
             token_data = (tokens, token_scales)
 
-        (
-            token_data,
-            expert_topk_ids,
-            expert_topk_weights,
-            expert_num_tokens_per_expert_list,
-            handle,
-            event,
-        ) = self.buffer.dispatch(
-            x=token_data,
-            handle=None,
-            num_tokens_per_rank=num_tokens_per_rank,
-            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-            is_token_in_rank=is_token_in_rank,
-            num_tokens_per_expert=dispatch_expert_num_tokens,
-            topk_idx=rank_topk_ids,
-            topk_weights=rank_topk_weights,
-            # expert_alignment rounds the number of tokens per expert
-            # to this value.
-            expert_alignment=1,
-            config=self._get_dispatch_config(),
-            previous_event=previous_event,
-            async_finish=self.async_prepare and not dbo_enabled(),
-            allocate_on_comm_stream=False,
-        )
+        with _profile_phase(sample, "dispatch_exchange"):
+            (
+                token_data,
+                expert_topk_ids,
+                expert_topk_weights,
+                expert_num_tokens_per_expert_list,
+                handle,
+                event,
+            ) = self.buffer.dispatch(
+                x=token_data,
+                handle=None,
+                num_tokens_per_rank=num_tokens_per_rank,
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+                is_token_in_rank=is_token_in_rank,
+                num_tokens_per_expert=dispatch_expert_num_tokens,
+                topk_idx=rank_topk_ids,
+                topk_weights=rank_topk_weights,
+                # expert_alignment rounds the number of tokens per expert
+                # to this value.
+                expert_alignment=1,
+                config=self._get_dispatch_config(),
+                previous_event=previous_event,
+                async_finish=self.async_prepare and not dbo_enabled(),
+                allocate_on_comm_stream=False,
+            )
 
         self._sync_dbo_comm_if_needed()
 
-        # record the handle for this ubatch
-        a2a_idx = dbo_current_ubatch_id()
         self.handles[a2a_idx] = handle
+
+        if sample is not None:
+            received = token_data[0] if isinstance(token_data, tuple) else token_data
+            sample.metadata.update(
+                received_tokens=received.shape[0],
+                received_tokens_per_expert=expert_num_tokens_per_expert_list,
+            )
 
         dbo_switch_to_compute_sync()
 
@@ -189,6 +311,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             a1_scale,
             quant_config,
             defer_input_quant=defer_input_quant,
+            profile_sample=sample,
         )
 
     def _receiver(
@@ -203,9 +326,11 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         a1_scale: torch.Tensor | None,
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool,
+        profile_sample: _DeepEPHTProfileSample | None,
     ) -> mk.PrepareResultType:
-        if event.event is not None:
-            event.current_stream_wait()
+        with _profile_phase(profile_sample, "dispatch_completion_wait"):
+            if event.event is not None:
+                event.current_stream_wait()
 
         if has_scales:
             expert_x, expert_x_scale = token_data
@@ -223,37 +348,42 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # DeepEP's topk_ids output refers to the local experts directly. Offset
         # the topk_ids to move it back to the global experts space so it aligns
         # with existing vLLM interfaces.
-        assert expert_topk_ids is not None
-        expert_topk_ids = torch.where(
-            expert_topk_ids == -1,
-            num_experts - 1 if self.rank_expert_offset == 0 else 0,
-            expert_topk_ids + self.rank_expert_offset,
-        )
+        with _profile_phase(profile_sample, "dispatch_remap_topk_ids"):
+            assert expert_topk_ids is not None
+            expert_topk_ids = torch.where(
+                expert_topk_ids == -1,
+                num_experts - 1 if self.rank_expert_offset == 0 else 0,
+                expert_topk_ids + self.rank_expert_offset,
+            )
 
         # Makes a GPU-CPU copy.
         # TODO (varun): Maybe it is better to re-compute the expert_num_tokens
         # on GPU.
-        expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
-            expert_num_tokens_per_expert_list, device=expert_x.device
-        )
+        with _profile_phase(profile_sample, "dispatch_build_metadata"):
+            expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
+                expert_num_tokens_per_expert_list, device=expert_x.device
+            )
 
         # * For non-block quant, dispatch in b16 and quantize now as
         #   DeepEP kernels only support dispatching block scales.
         # * For expert kernels that require unquantized inputs,
         #   defer quantization to FusedMoEExpertsPermuteUnpermute.
-        if not quant_config.is_block_quantized and not defer_input_quant:
-            # Quantize after dispatch.
-            expert_x_scale = None
-            if expert_x.numel() != 0:
-                # TODO: support per_act_token_quant,
-                expert_x, expert_x_scale = moe_kernel_quantize_input(
-                    expert_x,
-                    a1_scale,
-                    quant_dtype=quant_config.quant_dtype,
-                    per_act_token_quant=False,
-                    block_shape=quant_config.block_shape,
-                    is_scale_swizzled=quant_config.is_scale_swizzled,
-                )
+        with _profile_phase(profile_sample, "dispatch_post_quantize"):
+            if not quant_config.is_block_quantized and not defer_input_quant:
+                # Quantize after dispatch.
+                expert_x_scale = None
+                if expert_x.numel() != 0:
+                    # TODO: support per_act_token_quant,
+                    expert_x, expert_x_scale = moe_kernel_quantize_input(
+                        expert_x,
+                        a1_scale,
+                        quant_dtype=quant_config.quant_dtype,
+                        per_act_token_quant=False,
+                        block_shape=quant_config.block_shape,
+                        is_scale_swizzled=quant_config.is_scale_swizzled,
+                    )
+
+        self._log_profile("dispatch", profile_sample)
 
         return (
             expert_x,
@@ -357,34 +487,43 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         a2a_idx = dbo_current_ubatch_id()
         handle = self.handles[a2a_idx]
         assert handle is not None
+        profile_sample = self._profile_samples[a2a_idx]
+
+        if profile_sample is not None:
+            profile_sample.metadata["combine_input_tokens"] = fused_expert_output.shape[
+                0
+            ]
+            profile_sample.metadata["combine_output_tokens"] = output.shape[0]
 
         # fused_expert_output can have 0 tokens - This happens when none of the
         # tokens from the all2all reach this EP rank.
-        if fused_expert_output.numel() != 0:
-            if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
-                weight_and_reduce_impl = TopKWeightAndReduceContiguous()
-            fused_expert_output = weight_and_reduce_impl.apply(
-                output=None,
-                fused_expert_output=fused_expert_output,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-            )
+        with _profile_phase(profile_sample, "combine_weight_and_reduce"):
+            if fused_expert_output.numel() != 0:
+                if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
+                    weight_and_reduce_impl = TopKWeightAndReduceContiguous()
+                fused_expert_output = weight_and_reduce_impl.apply(
+                    output=None,
+                    fused_expert_output=fused_expert_output,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                )
         previous_event = dbo_get_previous_event(self.buffer.capture)
         dbo_yield_and_switch_from_compute_to_comm()
         assert fused_expert_output.dtype == torch.bfloat16, (
             f"Expected fused_expert_output bfloat16, got {fused_expert_output.dtype}"
         )
-        combined_x, _, event = self.buffer.combine(
-            # HT combine only supports BF16
-            x=fused_expert_output,
-            handle=handle,
-            topk_weights=None,
-            config=self._get_combine_config(),
-            previous_event=previous_event,
-            async_finish=do_async and not dbo_enabled(),
-            allocate_on_comm_stream=False,
-        )
+        with _profile_phase(profile_sample, "combine_exchange"):
+            combined_x, _, event = self.buffer.combine(
+                # HT combine only supports BF16
+                x=fused_expert_output,
+                handle=handle,
+                topk_weights=None,
+                config=self._get_combine_config(),
+                previous_event=previous_event,
+                async_finish=do_async and not dbo_enabled(),
+                allocate_on_comm_stream=False,
+            )
 
         self._sync_dbo_comm_if_needed()
 
@@ -393,10 +532,15 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if do_async:
 
             def _receiver():
-                if event.event is not None:
-                    event.current_stream_wait()
+                with _profile_phase(profile_sample, "combine_completion_wait"):
+                    if event.event is not None:
+                        event.current_stream_wait()
                 dbo_switch_to_comm()
-                output.copy_(combined_x, non_blocking=True)
+                with _profile_phase(profile_sample, "combine_output_copy"):
+                    output.copy_(combined_x, non_blocking=True)
+
+                self._log_profile("combine", profile_sample)
+                self._profile_samples[a2a_idx] = None
 
                 # TODO(lucas): refactor the modular kernel so this will be
                 # handled there
@@ -406,7 +550,10 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         else:
             # TODO(lucas): support this case with the refactored modular kernel
             assert not dbo_enabled()
-            output.copy_(combined_x, non_blocking=True)
+            with _profile_phase(profile_sample, "combine_output_copy"):
+                output.copy_(combined_x, non_blocking=True)
+            self._log_profile("combine", profile_sample)
+            self._profile_samples[a2a_idx] = None
             return None
 
     def finalize_async(

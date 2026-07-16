@@ -430,6 +430,8 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
+        self._attach_sc_eplb_next_gate_lora()
+
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,
@@ -443,6 +445,25 @@ class Worker(WorkerBase):
 
     def reload_weights(self, *args, **kwargs) -> None:
         self.model_runner.reload_weights(*args, **kwargs)
+        self._attach_sc_eplb_next_gate_lora()
+
+    def _attach_sc_eplb_next_gate_lora(self) -> None:
+        self.model_runner.sc_eplb_next_gate_lora = None
+        if envs.VLLM_SC_EPLB:
+            from vllm.model_executor.layers.fused_moe.next_gate_lora import (
+                maybe_attach_sc_eplb_next_gate_lora,
+            )
+
+            self.model_runner.sc_eplb_next_gate_lora = (
+                maybe_attach_sc_eplb_next_gate_lora(
+                    static_forward_context=(
+                        self.vllm_config.compilation_config.static_forward_context
+                    ),
+                    model=self.model_runner.get_model(),
+                    enabled=True,
+                    lora_dir=envs.VLLM_SC_EPLB_LORA_DIR,
+                )
+            )
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -880,6 +901,18 @@ class Worker(WorkerBase):
                 self.model_runner._dummy_pooler_run(hidden_states)
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
+
+        from vllm.model_executor.layers.fused_moe.moe_trace import (
+            maybe_attach_moe_trace,
+        )
+
+        self.model_runner.moe_trace_collector = maybe_attach_moe_trace(
+            enforce_eager=self.model_config.enforce_eager,
+            static_forward_context=(
+                self.vllm_config.compilation_config.static_forward_context
+            ),
+            model=self.model_runner.get_model(),
+        )
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.

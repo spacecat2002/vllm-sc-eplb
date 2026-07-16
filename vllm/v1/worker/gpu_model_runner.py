@@ -4178,6 +4178,15 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            moe_trace_collector = getattr(self, "moe_trace_collector", None)
+            if moe_trace_collector is not None:
+                moe_trace_collector.begin_forward(
+                    num_scheduled_tokens_np.tolist(),
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
+                    self.input_batch.num_prompt_tokens[:num_reqs].tolist(),
+                    list(req_ids),
+                )
+
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,

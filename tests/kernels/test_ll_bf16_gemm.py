@@ -251,6 +251,47 @@ def test_output_fp32(M, K):
     assert _gemm(a, b).dtype == torch.float32
 
 
+@pytest.mark.parametrize("M", [1, 4, 8, 16])
+@pytest.mark.parametrize("N,K", [(128, 2048), (256, 7168)])
+def test_dual_gate_lora(M, N, K):
+    from vllm.model_executor.kernels.linear.dual_gate_lora import (
+        dual_gate_backend,
+        dual_gate_lora,
+    )
+
+    torch.manual_seed(42)
+    hidden_states = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    current_weight = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+    next_weight = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+    delta_weight = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+
+    assert (
+        dual_gate_backend(
+            hidden_states,
+            current_weight,
+            next_weight,
+            delta_weight,
+        )
+        == "cutedsl"
+    )
+
+    current_logits, next_logits = dual_gate_lora(
+        hidden_states,
+        current_weight,
+        next_weight,
+        delta_weight,
+    )
+
+    assert current_logits.dtype == torch.float32
+    assert next_logits.dtype == torch.float32
+    assert current_logits.is_contiguous()
+    assert next_logits.is_contiguous()
+    _assert_close(current_logits, _ref(hidden_states, current_weight))
+    expected_next = _ref(hidden_states, next_weight)
+    expected_next += _ref(hidden_states, delta_weight)
+    _assert_close(next_logits, expected_next)
+
+
 # =================================================================
 # Determinism
 # =================================================================

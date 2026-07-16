@@ -287,6 +287,25 @@ class MoERunner(MoERunnerInterface):
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
 
+        self._next_gate_predictor: (
+            tuple[int, Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]]
+            | None
+        ) = None
+        self._last_next_gate_prediction: (
+            tuple[int, torch.Tensor, torch.Tensor] | None
+        ) = None
+        self._next_gate_prediction_stream: torch.cuda.Stream | None = None
+        self._next_gate_prediction_stream_device: torch.device | None = None
+        self._next_gate_prediction_event: torch.cuda.Event | None = None
+        self._fused_gate_current_weight: torch.Tensor | None = None
+        self._fused_gate_next_weight: torch.Tensor | None = None
+        self.register_buffer("_fused_gate_prediction_weight", None, persistent=False)
+        self._fused_gate_prediction_layer_id: int | None = None
+        self._fused_gate_prediction_router: (
+            Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None
+        ) = None
+        self._fused_gate_prediction_output_dtype: torch.dtype | None = None
+
         self._forward_entry = self._select_forward()
 
         # For smuggling this layer into the fused moe custom op
@@ -342,6 +361,203 @@ class MoERunner(MoERunnerInterface):
                 [self.gate.weight, self.shared_expert_gate.weight],
                 dim=0,
             )
+
+    def set_next_gate_predictor(
+        self,
+        next_layer_id: int,
+        predictor: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        """Attach a side-channel predictor for the next MoE layer."""
+        self._next_gate_predictor = (next_layer_id, predictor)
+        self._last_next_gate_prediction = None
+        self._next_gate_prediction_event = None
+        self._fused_gate_prediction_weight = None
+        self._fused_gate_current_weight = None
+        self._fused_gate_next_weight = None
+        self._fused_gate_prediction_layer_id = None
+        self._fused_gate_prediction_router = None
+        self._fused_gate_prediction_output_dtype = None
+
+    def set_fused_next_gate_predictor(
+        self,
+        *,
+        next_layer_id: int,
+        current_weight: torch.Tensor,
+        next_weight: torch.Tensor,
+        next_delta_weight: torch.Tensor,
+        route: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        output_dtype: torch.dtype | None,
+    ) -> None:
+        """Fuse current and predicted-next projections without merging weights."""
+        self._fused_gate_current_weight = current_weight
+        self._fused_gate_next_weight = next_weight
+        self._fused_gate_prediction_weight = next_delta_weight
+        self._fused_gate_prediction_layer_id = next_layer_id
+        self._fused_gate_prediction_router = route
+        self._fused_gate_prediction_output_dtype = output_dtype
+        self._next_gate_predictor = None
+        self._last_next_gate_prediction = None
+        self._next_gate_prediction_event = None
+        self._reserve_fused_gate_output_buffers()
+
+    def clear_next_gate_predictor(self) -> None:
+        self._next_gate_predictor = None
+        self._last_next_gate_prediction = None
+        self._next_gate_prediction_event = None
+        self._fused_gate_prediction_weight = None
+        self._fused_gate_current_weight = None
+        self._fused_gate_next_weight = None
+        self._fused_gate_prediction_layer_id = None
+        self._fused_gate_prediction_router = None
+        self._fused_gate_prediction_output_dtype = None
+
+    def _reserve_fused_gate_output_buffers(self) -> None:
+        current_weight = self._fused_gate_current_weight
+        next_weight = self._fused_gate_next_weight
+        assert current_weight is not None and next_weight is not None
+        output_dtype = self._fused_gate_prediction_output_dtype or current_weight.dtype
+        from vllm.model_executor.kernels.linear.dual_gate_lora import (
+            get_dual_gate_output_workspace,
+        )
+
+        slots = range(2) if self.enable_dbo else range(1)
+        for slot in slots:
+            get_dual_gate_output_workspace(
+                device=current_weight.device,
+                dtype=output_dtype,
+                slot=slot,
+                num_tokens=min(16, self.moe_config.max_num_tokens),
+                current_experts=current_weight.shape[0],
+                next_experts=next_weight.shape[0],
+            )
+
+    def _get_fused_gate_outputs(
+        self, num_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+        slot = dbo_current_ubatch_id()
+        current_weight = self._fused_gate_current_weight
+        next_weight = self._fused_gate_next_weight
+        assert current_weight is not None and next_weight is not None
+        output_dtype = self._fused_gate_prediction_output_dtype or current_weight.dtype
+        from vllm.model_executor.kernels.linear.dual_gate_lora import (
+            get_dual_gate_output_workspace,
+        )
+
+        return get_dual_gate_output_workspace(
+            device=current_weight.device,
+            dtype=output_dtype,
+            slot=slot,
+            num_tokens=num_tokens,
+            current_experts=current_weight.shape[0],
+            next_experts=next_weight.shape[0],
+        )
+
+    def get_last_next_gate_prediction(
+        self, *, wait: bool = True
+    ) -> tuple[int, torch.Tensor, torch.Tensor] | None:
+        """Return the last prediction.
+
+        The logits tensor is a shared workspace view and remains valid only
+        until another MoE layer reuses the same micro-batch slot.
+        """
+        if wait and self._next_gate_prediction_event is not None:
+            self._next_gate_prediction_event.synchronize()
+            self._next_gate_prediction_event = None
+        return self._last_next_gate_prediction
+
+    def _get_next_gate_prediction_stream(
+        self, device: torch.device
+    ) -> torch.cuda.Stream:
+        if (
+            self._next_gate_prediction_stream is None
+            or self._next_gate_prediction_stream_device != device
+        ):
+            with torch.cuda.device(device):
+                self._next_gate_prediction_stream = torch.cuda.Stream()
+            self._next_gate_prediction_stream_device = device
+        return self._next_gate_prediction_stream
+
+    def _maybe_predict_next_gate(self, hidden_states: torch.Tensor) -> None:
+        if (
+            self._fused_gate_prediction_weight is not None
+            or self._next_gate_predictor is None
+        ):
+            return
+        next_layer_id, predictor = self._next_gate_predictor
+        if not hidden_states.is_cuda:
+            predicted_topk_ids, base_router_logits = predictor(hidden_states)
+            self._next_gate_prediction_event = None
+            self._last_next_gate_prediction = (
+                next_layer_id,
+                predicted_topk_ids,
+                base_router_logits,
+            )
+            return
+
+        current_stream = torch.cuda.current_stream(hidden_states.device)
+        prediction_stream = self._get_next_gate_prediction_stream(hidden_states.device)
+        prediction_stream.wait_stream(current_stream)
+        hidden_states.record_stream(prediction_stream)
+        with torch.cuda.stream(prediction_stream):
+            predicted_topk_ids, base_router_logits = predictor(hidden_states)
+            event = torch.cuda.Event()
+            event.record(prediction_stream)
+        self._last_next_gate_prediction = (
+            next_layer_id,
+            predicted_topk_ids,
+            base_router_logits,
+        )
+        self._next_gate_prediction_event = event
+
+    def _apply_fused_gate_prediction(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        delta_weight = self._fused_gate_prediction_weight
+        current_weight = self._fused_gate_current_weight
+        next_weight = self._fused_gate_next_weight
+        route = self._fused_gate_prediction_router
+        next_layer_id = self._fused_gate_prediction_layer_id
+        assert (
+            delta_weight is not None
+            and current_weight is not None
+            and next_weight is not None
+            and route is not None
+            and next_layer_id is not None
+        )
+        gate_input = hidden_states.to(current_weight.dtype)
+        output_dtype = self._fused_gate_prediction_output_dtype
+        if gate_input.is_cuda and gate_input.dtype in (torch.float16, torch.bfloat16):
+            from vllm.model_executor.kernels.linear.dual_gate_lora import (
+                dual_gate_lora,
+            )
+
+            current_output, next_output = self._get_fused_gate_outputs(
+                gate_input.shape[0]
+            )
+            current_logits, predicted_logits = dual_gate_lora(
+                gate_input,
+                current_weight,
+                next_weight,
+                delta_weight,
+                output_dtype=output_dtype or current_weight.dtype,
+                current_output=current_output,
+                next_output=next_output,
+            )
+        else:
+            current_logits = F.linear(gate_input, current_weight)
+            predicted_logits = F.linear(gate_input, next_weight)
+            predicted_logits += F.linear(gate_input, delta_weight)
+            if output_dtype is not None:
+                current_logits = current_logits.to(output_dtype)
+                predicted_logits = predicted_logits.to(output_dtype)
+        predicted_topk_ids = route(hidden_states, predicted_logits)
+        self._last_next_gate_prediction = (
+            next_layer_id,
+            predicted_topk_ids,
+            predicted_logits,
+        )
+        self._next_gate_prediction_event = None
+        return current_logits
 
     @property
     def _quant_method(self) -> FusedMoEMethodBase:
@@ -560,6 +776,8 @@ class MoERunner(MoERunnerInterface):
         self._maybe_apply_shared_experts(
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
+
+        self._maybe_predict_next_gate(hidden_states)
 
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
@@ -818,7 +1036,9 @@ class MoERunner(MoERunnerInterface):
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
         if self.gate is not None:
-            if self._fse_fuse_gate:
+            if self._fused_gate_prediction_weight is not None:
+                router_logits = self._apply_fused_gate_prediction(hidden_states)
+            elif self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
             else:

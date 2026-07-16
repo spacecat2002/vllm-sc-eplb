@@ -51,6 +51,7 @@ nav:
   - Benchmarking:
       - benchmarking/README.md
       - benchmarking/cli.md
+      - benchmarking/moe_dbo.md
       - benchmarking/sweeps.md
       - benchmarking/dashboard.md
   - API Reference:

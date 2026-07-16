@@ -274,9 +274,160 @@ class LLBf16Gemm:
 ll_bf16_gemm_kernel = LLBf16Gemm()
 
 
+class LLBf16DualGateGemm:
+    def __init__(self) -> None:
+        self._compiled_cache: dict[tuple[int, int, int], Any] = {}
+
+    @staticmethod
+    def _validate_inputs(
+        hidden_states: torch.Tensor,
+        current_weight: torch.Tensor,
+        next_weight: torch.Tensor,
+        delta_weight: torch.Tensor,
+    ) -> None:
+        LLBf16Gemm._validate_inputs(hidden_states, current_weight, torch.float32)
+        LLBf16Gemm._validate_inputs(hidden_states, next_weight, torch.float32)
+        LLBf16Gemm._validate_inputs(hidden_states, delta_weight, torch.float32)
+        if next_weight.shape != delta_weight.shape:
+            raise ValueError("next_weight and delta_weight must have matching shapes")
+        if hidden_states.shape[0] > 16:
+            raise ValueError("ll_bf16_dual_gate_gemm supports at most 16 tokens")
+
+    def _compile(self, M: int, K: int, bs: int) -> None:
+        cute, _ = _cute()
+        from cutlass import BFloat16, Float32
+        from quack.compile_utils import make_fake_tensor
+
+        from ._ll_bf16_dual_gate import LLBf16DualGate
+
+        current_experts = cute.sym_int()
+        next_experts = cute.sym_int()
+        hidden_states = make_fake_tensor(BFloat16, (M, K), divisibility=8)
+        current_weight = make_fake_tensor(
+            BFloat16, (current_experts, K), divisibility=8
+        )
+        next_weight = make_fake_tensor(BFloat16, (next_experts, K), divisibility=8)
+        delta_weight = make_fake_tensor(BFloat16, (next_experts, K), divisibility=8)
+        current_output = make_fake_tensor(Float32, (M, current_experts), divisibility=1)
+        next_output = make_fake_tensor(Float32, (M, next_experts), divisibility=1)
+        gemm = LLBf16DualGate(k=K, bs=bs, use_pdl=_use_pdl())
+        compiled = cute.compile(
+            gemm,
+            hidden_states,
+            current_weight,
+            next_weight,
+            delta_weight,
+            current_output,
+            next_output,
+            M,
+            1,
+            1,
+            _stream(),
+            options="--enable-tvm-ffi --ptxas-options -maxrregcount=64",
+        )
+        self._compiled_cache[(M, K, bs)] = compiled
+
+    def __call__(
+        self,
+        hidden_states: torch.Tensor,
+        current_weight: torch.Tensor,
+        next_weight: torch.Tensor,
+        delta_weight: torch.Tensor,
+        current_output: torch.Tensor | None = None,
+        next_output: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._validate_inputs(hidden_states, current_weight, next_weight, delta_weight)
+        M, K = hidden_states.shape
+        current_experts = current_weight.shape[0]
+        next_experts = next_weight.shape[0]
+        if current_output is None:
+            current_output = torch.empty(
+                M, current_experts, dtype=torch.float32, device=hidden_states.device
+            )
+        if next_output is None:
+            next_output = torch.empty(
+                M, next_experts, dtype=torch.float32, device=hidden_states.device
+            )
+        if current_output.shape != (M, current_experts):
+            raise ValueError("current_output has an invalid shape")
+        if next_output.shape != (M, next_experts):
+            raise ValueError("next_output has an invalid shape")
+        for output in (current_output, next_output):
+            if (
+                output.dtype != torch.float32
+                or output.device != hidden_states.device
+                or not output.is_contiguous()
+            ):
+                raise ValueError("dual-gate outputs must be contiguous CUDA fp32")
+
+        cache_key = (M, K, _DEFAULT_DOTPROD_BS)
+        if cache_key not in self._compiled_cache:
+            self._compile(*cache_key)
+        self._compiled_cache[cache_key](
+            hidden_states,
+            current_weight,
+            next_weight,
+            delta_weight,
+            current_output,
+            next_output,
+            current_experts,
+            next_experts,
+            _stream(),
+        )
+        return current_output, next_output
+
+
+ll_bf16_dual_gate_gemm_kernel = LLBf16DualGateGemm()
+
+
 def ll_bf16_gemm(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     return ll_bf16_gemm_kernel(hidden_states, router_weight, output_dtype)
+
+
+def can_use_ll_bf16_dual_gate_gemm(
+    hidden_states: torch.Tensor,
+    current_weight: torch.Tensor,
+    next_weight: torch.Tensor,
+    delta_weight: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> bool:
+    tensors = (hidden_states, current_weight, next_weight, delta_weight)
+    return (
+        is_available()
+        and hidden_states.ndim == 2
+        and hidden_states.shape[0] <= 16
+        and hidden_states.shape[1] % 8 == 0
+        and hidden_states.device.type == "cuda"
+        and torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+        and output_dtype == torch.float32
+        and all(tensor.dtype == torch.bfloat16 for tensor in tensors)
+        and all(tensor.device == hidden_states.device for tensor in tensors)
+        and all(tensor.is_contiguous() for tensor in tensors)
+        and all(
+            weight.ndim == 2 and weight.shape[1] == hidden_states.shape[1]
+            for weight in tensors[1:]
+        )
+        and next_weight.shape == delta_weight.shape
+    )
+
+
+def ll_bf16_dual_gate_gemm(
+    hidden_states: torch.Tensor,
+    current_weight: torch.Tensor,
+    next_weight: torch.Tensor,
+    delta_weight: torch.Tensor,
+    current_output: torch.Tensor | None = None,
+    next_output: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return ll_bf16_dual_gate_gemm_kernel(
+        hidden_states,
+        current_weight,
+        next_weight,
+        delta_weight,
+        current_output,
+        next_output,
+    )

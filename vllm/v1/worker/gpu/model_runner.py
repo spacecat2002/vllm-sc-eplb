@@ -1192,6 +1192,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+
+            moe_trace_collector = getattr(self, "moe_trace_collector", None)
+            if moe_trace_collector is not None:
+                moe_trace_collector.begin_forward(
+                    input_batch.num_scheduled_tokens.tolist(),
+                    input_batch.num_computed_tokens_np.tolist(),
+                    input_batch.prefill_len_np.tolist(),
+                    list(input_batch.req_ids),
+                )
+
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
