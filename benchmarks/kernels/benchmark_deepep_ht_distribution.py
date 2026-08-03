@@ -54,6 +54,9 @@ from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExpert
 from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht import (
     DeepEPHTPrepareAndFinalize,
 )
+from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+    MoEPrepareAndFinalizeNoDPEPModular,
+)
 from vllm.utils.math_utils import next_power_of_2
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -114,6 +117,22 @@ def parse_args() -> argparse.Namespace:
             "Enable VLLM_DEEPEP_HT_PROFILE for layout/exchange/postprocess "
             "breakdowns. Disable it for uninstrumented baseline timings."
         ),
+    )
+    parser.add_argument(
+        "--execution-mode",
+        choices=("full_deepep", "local_bypass"),
+        default="full_deepep",
+        help=(
+            "Use full_deepep for the production path, or local_bypass to run "
+            "fully-local tokens through a local MoE kernel and send only the "
+            "remaining tokens through DeepEP."
+        ),
+    )
+    parser.add_argument(
+        "--validate-output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compare local_bypass output against full_deepep before timing.",
     )
     parser.add_argument(
         "--output-jsonl",
@@ -341,12 +360,12 @@ def make_vllm_config(
     return vllm_config
 
 
-def make_kernel(
+def make_kernels(
     args: argparse.Namespace,
     vllm_config: VllmConfig,
     dtype: torch.dtype,
     device: torch.device,
-) -> mk.FusedMoEKernel:
+) -> tuple[mk.FusedMoEKernel, mk.FusedMoEKernel]:
     moe_parallel_config = FusedMoEParallelConfig.make(
         tp_size_=get_tensor_model_parallel_world_size(),
         pcp_size_=get_pcp_group().world_size,
@@ -380,10 +399,14 @@ def make_kernel(
             "Expected DeepEPHTPrepareAndFinalize, got "
             f"{type(prepare_finalize).__name__}"
         )
-    return mk.FusedMoEKernel(
-        prepare_finalize,
+    deepep_kernel = mk.FusedMoEKernel(
+        prepare_finalize, TritonExperts(moe_config, quant_config)
+    )
+    local_kernel = mk.FusedMoEKernel(
+        MoEPrepareAndFinalizeNoDPEPModular(),
         TritonExperts(moe_config, quant_config),
     )
+    return deepep_kernel, local_kernel
 
 
 def make_base_tensors(
@@ -444,6 +467,7 @@ def run_one_iter(
     world_size: int,
     device: torch.device,
     profile_warmup: int,
+    capture_output: bool = False,
 ) -> dict[str, Any]:
     assert isinstance(kernel.impl, mk.FusedMoEKernelModularImpl)
     requested_dtype = kernel.prepare_finalize.topk_indices_dtype()
@@ -548,8 +572,9 @@ def run_one_iter(
                 f"Expected detail sample {profile_sample}, got "
                 f"{detail_sample.sample_id}"
             )
-    return {
+    record = {
         "record_type": "rank",
+        "execution_mode": "full_deepep",
         "distribution": distribution,
         "target_share": target_share,
         "hot_share": target_share if distribution == "hot_rank" else None,
@@ -566,6 +591,8 @@ def run_one_iter(
         "source_target_unique_tokens": target_unique_tokens,
         "remote_assignments": remote_assignments,
         "remote_unique_tokens": remote_unique_tokens,
+        "local_path_tokens": 0,
+        "deepep_source_tokens": args.tokens,
         "actual_local_share": actual_local_share,
         "remote_payload_bytes": remote_unique_tokens
         * args.hidden_size
@@ -580,6 +607,231 @@ def run_one_iter(
             dict(detail_sample.metadata) if detail_sample is not None else None
         ),
     }
+    if capture_output:
+        record["output"] = output.clone()
+    return record
+
+
+def run_local_bypass_iter(
+    args: argparse.Namespace,
+    deepep_kernel: mk.FusedMoEKernel,
+    local_kernel: mk.FusedMoEKernel,
+    tensors: dict[str, torch.Tensor],
+    topk_ids: torch.Tensor,
+    *,
+    distribution: str,
+    target_share: float,
+    iteration: int,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    capture_output: bool = False,
+) -> dict[str, Any]:
+    assert isinstance(deepep_kernel.impl, mk.FusedMoEKernelModularImpl)
+    assert isinstance(local_kernel.impl, mk.FusedMoEKernelModularImpl)
+    requested_dtype = deepep_kernel.prepare_finalize.topk_indices_dtype()
+    if requested_dtype is not None:
+        topk_ids = topk_ids.to(requested_dtype)
+
+    hidden_states = tensors["hidden_states"]
+    topk_weights = tensors["topk_weights"]
+    local_num_experts = tensors["w1"].shape[0]
+    target_assignments, target_unique_tokens = rank_distribution(
+        topk_ids, local_num_experts, world_size
+    )
+    remote_assignments = sum(target_assignments) - target_assignments[rank]
+    remote_unique_tokens = sum(target_unique_tokens) - target_unique_tokens[rank]
+    actual_local_share = target_unique_tokens[rank] / args.tokens
+
+    def prepare():
+        target_ranks = torch.div(
+            topk_ids,
+            local_num_experts,
+            rounding_mode="floor",
+        )
+        local_mask = torch.all(target_ranks == rank, dim=1)
+        local_indices = torch.where(local_mask)[0]
+        remote_indices = torch.where(~local_mask)[0]
+
+        def prepare_batch(
+            kernel: mk.FusedMoEKernel,
+            indices: torch.Tensor,
+        ) -> dict[str, Any] | None:
+            if indices.numel() == 0:
+                return None
+            batch_hidden = hidden_states.index_select(0, indices)
+            batch_weights = topk_weights.index_select(0, indices)
+            batch_ids = topk_ids.index_select(0, indices)
+            prepared = kernel.impl._prepare(
+                batch_hidden,
+                batch_weights,
+                batch_ids,
+                args.num_experts,
+                tensors["expert_map"],
+                False,
+            )
+            return {
+                "indices": indices,
+                "hidden_states": batch_hidden,
+                "prepared": prepared,
+            }
+
+        return (
+            prepare_batch(local_kernel, local_indices),
+            prepare_batch(deepep_kernel, remote_indices),
+        )
+
+    (local_batch, remote_batch), dispatch_ms = time_stage(
+        device,
+        prepare,
+        use_barrier=args.stage_barrier,
+    )
+
+    def compute_batch(
+        kernel: mk.FusedMoEKernel,
+        batch: dict[str, Any] | None,
+    ) -> torch.Tensor | None:
+        if batch is None:
+            return None
+        (
+            a1q,
+            a1q_scale,
+            expert_tokens_meta,
+            dispatched_topk_ids,
+            dispatched_topk_weights,
+        ) = batch["prepared"]
+        return kernel.impl._fused_experts(
+            in_dtype=hidden_states.dtype,
+            a1q=a1q,
+            a1q_scale=a1q_scale,
+            w1=tensors["w1"],
+            w2=tensors["w2"],
+            topk_weights=dispatched_topk_weights,
+            topk_ids=dispatched_topk_ids,
+            activation=MoEActivation.SILU,
+            global_num_experts=args.num_experts,
+            local_num_experts=local_num_experts,
+            expert_map=tensors["expert_map"],
+            apply_router_weight_on_input=False,
+            expert_tokens_meta=expert_tokens_meta,
+            output_alias=None,
+        )
+
+    def compute():
+        return (
+            compute_batch(local_kernel, local_batch),
+            compute_batch(deepep_kernel, remote_batch),
+        )
+
+    (local_fused_out, remote_fused_out), compute_ms = time_stage(
+        device,
+        compute,
+        use_barrier=args.stage_barrier,
+    )
+
+    output = torch.empty_like(hidden_states)
+
+    def finalize_batch(
+        kernel: mk.FusedMoEKernel,
+        batch: dict[str, Any] | None,
+        fused_out: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if batch is None:
+            return None
+        assert fused_out is not None
+        (
+            _,
+            _,
+            _,
+            dispatched_topk_ids,
+            dispatched_topk_weights,
+        ) = batch["prepared"]
+        batch_output = torch.empty_like(batch["hidden_states"])
+        kernel.impl._finalize(
+            batch_output,
+            fused_out,
+            batch["hidden_states"],
+            dispatched_topk_weights,
+            dispatched_topk_ids,
+            False,
+            None,
+            None,
+        )
+        return batch_output
+
+    def finalize():
+        local_output = finalize_batch(local_kernel, local_batch, local_fused_out)
+        remote_output = finalize_batch(deepep_kernel, remote_batch, remote_fused_out)
+        if local_batch is not None:
+            assert local_output is not None
+            output.index_copy_(0, local_batch["indices"], local_output)
+        if remote_batch is not None:
+            assert remote_output is not None
+            output.index_copy_(0, remote_batch["indices"], remote_output)
+
+    _, combine_ms = time_stage(
+        device,
+        finalize,
+        use_barrier=args.stage_barrier,
+    )
+
+    local_expert_tokens = torch.zeros(
+        local_num_experts, dtype=torch.int64, device=device
+    )
+    if local_batch is not None:
+        local_ids = local_batch["prepared"][3].to(torch.int64)
+        local_ids = local_ids - rank * local_num_experts
+        local_expert_tokens += torch.bincount(
+            local_ids.flatten(), minlength=local_num_experts
+        )
+    if remote_batch is not None:
+        remote_meta = remote_batch["prepared"][2]
+        if remote_meta is None:
+            raise RuntimeError("DeepEP-HT did not return expert token metadata")
+        local_expert_tokens += remote_meta.expert_num_tokens.to(torch.int64)
+    local_expert_tokens_list = [
+        int(value) for value in local_expert_tokens.detach().cpu().tolist()
+    ]
+    local_path_tokens = (
+        int(local_batch["indices"].numel()) if local_batch is not None else 0
+    )
+    deepep_source_tokens = (
+        int(remote_batch["indices"].numel()) if remote_batch is not None else 0
+    )
+    record = {
+        "record_type": "rank",
+        "execution_mode": "local_bypass",
+        "distribution": distribution,
+        "target_share": target_share,
+        "hot_share": None,
+        "local_share": target_share,
+        "iter": iteration,
+        "rank": rank,
+        "world_size": world_size,
+        "profile_sample": None,
+        "dispatch_ms": dispatch_ms,
+        "expert_compute_ms": compute_ms,
+        "combine_ms": combine_ms,
+        "total_ms": dispatch_ms + compute_ms + combine_ms,
+        "source_target_assignments": target_assignments,
+        "source_target_unique_tokens": target_unique_tokens,
+        "remote_assignments": remote_assignments,
+        "remote_unique_tokens": remote_unique_tokens,
+        "local_path_tokens": local_path_tokens,
+        "deepep_source_tokens": deepep_source_tokens,
+        "actual_local_share": actual_local_share,
+        "remote_payload_bytes": remote_unique_tokens
+        * args.hidden_size
+        * hidden_states.element_size(),
+        "active_destinations": sum(count > 0 for count in target_unique_tokens),
+        "received_tokens": sum(local_expert_tokens_list),
+        "local_expert_tokens": local_expert_tokens_list,
+        "detail_timings_ms": None,
+        "detail_metadata": None,
+    }
+    if capture_output:
+        record["output"] = output.clone()
+    return record
 
 
 def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -595,6 +847,8 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         totals = [row["total_ms"] for row in rows]
         received = [row["received_tokens"] for row in rows]
         actual_local_shares = [row["actual_local_share"] for row in rows]
+        local_path_tokens = sum(row["local_path_tokens"] for row in rows)
+        deepep_source_tokens = sum(row["deepep_source_tokens"] for row in rows)
         remote_payload_bytes = sum(row["remote_payload_bytes"] for row in rows)
         remote_unique_tokens = sum(row["remote_unique_tokens"] for row in rows)
         dispatch_row = max(rows, key=lambda row: row["dispatch_ms"])
@@ -624,6 +878,7 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         aggregates.append(
             {
                 "record_type": "aggregate",
+                "execution_mode": rows[0]["execution_mode"],
                 "distribution": rows[0]["distribution"],
                 "target_share": rows[0]["target_share"],
                 "hot_share": rows[0]["hot_share"],
@@ -642,6 +897,8 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "received_tokens_max": max(received),
                 "actual_local_share_min": min(actual_local_shares),
                 "actual_local_share_max": max(actual_local_shares),
+                "local_path_tokens_total": local_path_tokens,
+                "deepep_source_tokens_total": deepep_source_tokens,
                 "remote_unique_tokens_total": remote_unique_tokens,
                 "remote_payload_bytes_total": remote_payload_bytes,
                 "detail_max_ms": detail_max_ms,
@@ -678,6 +935,7 @@ def summarize(aggregates: list[dict[str, Any]], trim_ratio: float) -> dict[str, 
             )
     return {
         "record_type": "summary",
+        "execution_mode": aggregates[0]["execution_mode"],
         "distribution": aggregates[0]["distribution"],
         "target_share": aggregates[0]["target_share"],
         "hot_share": aggregates[0]["hot_share"],
@@ -692,6 +950,12 @@ def summarize(aggregates: list[dict[str, Any]], trim_ratio: float) -> dict[str, 
         "received_tokens_max": max(row["received_tokens_max"] for row in kept),
         "actual_local_share_min": min(row["actual_local_share_min"] for row in kept),
         "actual_local_share_max": max(row["actual_local_share_max"] for row in kept),
+        "local_path_tokens": statistics.mean(
+            row["local_path_tokens_total"] for row in kept
+        ),
+        "deepep_source_tokens": statistics.mean(
+            row["deepep_source_tokens_total"] for row in kept
+        ),
         "remote_unique_tokens": statistics.mean(
             row["remote_unique_tokens_total"] for row in kept
         ),
@@ -710,8 +974,9 @@ def summarize(aggregates: list[dict[str, Any]], trim_ratio: float) -> dict[str, 
 
 def print_summaries(summaries: list[dict[str, Any]]) -> None:
     print(
-        "distribution share actual_local dispatch_ms compute_ms combine_ms "
-        "total_ms recv_min recv_max remote_tokens remote_mib detail_samples"
+        "execution_mode distribution share actual_local dispatch_ms compute_ms "
+        "combine_ms total_ms local_tokens deepep_tokens recv_min recv_max "
+        "remote_tokens remote_mib detail_samples"
     )
     for row in summaries:
         sample_range = (
@@ -720,6 +985,7 @@ def print_summaries(summaries: list[dict[str, Any]]) -> None:
             else "disabled"
         )
         print(
+            f"{row['execution_mode']:>14} "
             f"{row['distribution']:>12} "
             f"{row['target_share']:>5.3f} "
             f"{row['actual_local_share_min']:>5.3f}:"
@@ -728,6 +994,8 @@ def print_summaries(summaries: list[dict[str, Any]]) -> None:
             f"{row['compute_ms']:>10.3f} "
             f"{row['combine_ms']:>10.3f} "
             f"{row['total_ms']:>8.3f} "
+            f"{row['local_path_tokens']:>12.1f} "
+            f"{row['deepep_source_tokens']:>13.1f} "
             f"{row['received_tokens_min']:>8} "
             f"{row['received_tokens_max']:>8} "
             f"{row['remote_unique_tokens']:>13.1f} "
@@ -809,7 +1077,7 @@ def run_worker(
             )
             initialize_model_parallel(tensor_model_parallel_size=1)
             init_workspace_manager(device)
-            kernel = make_kernel(args, vllm_config, dtype, device)
+            deepep_kernel, local_kernel = make_kernels(args, vllm_config, dtype, device)
             tensors = make_base_tensors(args, rank, world_size, dtype, device)
             num_tokens_across_dp = torch.full(
                 (world_size,), args.tokens, device=device, dtype=torch.int
@@ -848,11 +1116,51 @@ def run_worker(
                         )
                         for target_share in target_shares
                     ]
-                for target_share, topk_ids in zip(target_shares, sweep_topk_ids):
-                    for _ in range(args.warmup):
-                        run_one_iter(
+
+                def run_iteration(
+                    topk_ids: torch.Tensor,
+                    target_share: float,
+                    sweep_index: int,
+                    iteration: int,
+                    *,
+                    capture_output: bool = False,
+                ) -> dict[str, Any]:
+                    if args.execution_mode == "local_bypass":
+                        return run_local_bypass_iter(
                             args,
-                            kernel,
+                            deepep_kernel,
+                            local_kernel,
+                            tensors,
+                            topk_ids,
+                            distribution=distribution,
+                            target_share=target_share,
+                            iteration=iteration,
+                            rank=rank,
+                            world_size=world_size,
+                            device=device,
+                            capture_output=capture_output,
+                        )
+                    return run_one_iter(
+                        args,
+                        deepep_kernel,
+                        tensors,
+                        topk_ids,
+                        distribution=distribution,
+                        target_share=target_share,
+                        sweep_index=sweep_index,
+                        iteration=iteration,
+                        rank=rank,
+                        world_size=world_size,
+                        device=device,
+                        profile_warmup=profile_warmup,
+                        capture_output=capture_output,
+                    )
+
+                if args.execution_mode == "local_bypass" and args.validate_output:
+                    for target_share, topk_ids in zip(target_shares, sweep_topk_ids):
+                        reference = run_one_iter(
+                            args,
+                            deepep_kernel,
                             tensors,
                             topk_ids,
                             distribution=distribution,
@@ -863,6 +1171,31 @@ def run_worker(
                             world_size=world_size,
                             device=device,
                             profile_warmup=profile_warmup,
+                            capture_output=True,
+                        )["output"]
+                        candidate = run_iteration(
+                            topk_ids,
+                            target_share,
+                            -1,
+                            -1,
+                            capture_output=True,
+                        )["output"]
+                        torch.testing.assert_close(
+                            reference,
+                            candidate,
+                            atol=6e-2,
+                            rtol=6e-2,
+                        )
+                    if rank == 0:
+                        print("Validated local_bypass outputs against full_deepep")
+
+                for target_share, topk_ids in zip(target_shares, sweep_topk_ids):
+                    for _ in range(args.warmup):
+                        run_iteration(
+                            topk_ids,
+                            target_share,
+                            -1,
+                            -1,
                         )
                 dist.barrier()
 
@@ -870,19 +1203,11 @@ def run_worker(
                     zip(target_shares, sweep_topk_ids)
                 ):
                     local_rows = [
-                        run_one_iter(
-                            args,
-                            kernel,
-                            tensors,
+                        run_iteration(
                             topk_ids,
-                            distribution=distribution,
-                            target_share=target_share,
-                            sweep_index=sweep_index,
-                            iteration=iteration,
-                            rank=rank,
-                            world_size=world_size,
-                            device=device,
-                            profile_warmup=profile_warmup,
+                            target_share,
+                            sweep_index,
+                            iteration,
                         )
                         for iteration in range(args.iters)
                     ]
@@ -922,6 +1247,11 @@ def main() -> None:
         distribution = "hot_rank"
         raw_hot_shares = args.hot_shares or "0,0.25,0.5,0.75,1"
         target_shares = parse_shares(raw_hot_shares, "--hot-shares")
+    if args.execution_mode == "local_bypass":
+        if distribution != "local_share":
+            raise ValueError("local_bypass requires --local-shares")
+        if args.detail_profile:
+            raise ValueError("local_bypass requires --no-detail-profile")
     if args.iters <= 0 or args.warmup < 0:
         raise ValueError("--iters must be positive and --warmup non-negative")
     if (
