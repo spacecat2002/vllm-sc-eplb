@@ -41,6 +41,38 @@ not currently implemented.
 The vLLM-internal `next_gate_lora.py` remains available for future serving-side
 experiments, but this package never enables or imports it.
 
+## Aggregate load-prediction example
+
+`load_predictor_example.py` tests a small DeepSets-style predictor that maps
+the current layer's complete Top-K route set to the next layer's normalized
+expert load. It predicts a residual over an expert transition matrix and
+reports metrics that match replica prefetching: hot-expert recall and routed
+token coverage at a fixed replica-slot budget.
+
+The default experiment generates scheduler forwards with token counts sampled
+from 8 to 256, so absolute load changes while the prediction target remains a
+normalized distribution:
+
+```bash
+.venv/bin/python -m moe_gate_lora.load_predictor_example \
+  --samples 200 \
+  --epochs 20 \
+  --replica-slots 4
+```
+
+To train on a collected full trace, select an adjacent source layer. The trace
+must use `VLLM_MOE_TRACE_MODE=lora_training`; count-only
+`expert_distribution` traces do not contain the per-token Top-K combinations
+used by the network.
+
+```bash
+.venv/bin/python -m moe_gate_lora.load_predictor_example \
+  --trace-dir /tmp/moe_gate_lora/trace \
+  --source-layer 10 \
+  --epochs 20 \
+  --replica-slots 4
+```
+
 The vLLM integration now has five environment variables. The pipeline manages
 the first three and forcibly disables the latter two in its workers:
 
