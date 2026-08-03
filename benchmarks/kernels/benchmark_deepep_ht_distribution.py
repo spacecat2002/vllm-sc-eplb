@@ -13,6 +13,11 @@ same rank and spread the remainder evenly across the other ranks::
 
 Use ``--no-detail-profile`` for wrapper timings without the diagnostic device
 synchronizations inserted inside DeepEP prepare/finalize.
+
+Use ``--model`` to select the MoE dimensions of a supported model without
+loading its weights::
+
+    --model Qwen/Qwen3-30B-A3B
 """
 
 from __future__ import annotations
@@ -60,19 +65,60 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
 from vllm.utils.math_utils import next_power_of_2
 from vllm.v1.worker.workspace import init_workspace_manager
 
+DEFAULT_MOE_CONFIG = {
+    "hidden_size": 4096,
+    "intermediate_size": 14336,
+    "num_experts": 8,
+    "top_k": 1,
+}
+
+MODEL_CONFIGS = {
+    "Qwen/Qwen3-30B-A3B": {
+        "hidden_size": 2048,
+        "intermediate_size": 768,
+        "num_experts": 128,
+        "top_k": 8,
+    },
+    "Qwen/Qwen3-235B-A22B": {
+        "hidden_size": 4096,
+        "intermediate_size": 1536,
+        "num_experts": 128,
+        "top_k": 8,
+    },
+}
+
+
+def apply_model_config(args: argparse.Namespace) -> argparse.Namespace:
+    config = MODEL_CONFIGS.get(args.model, DEFAULT_MOE_CONFIG)
+    for name, value in config.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+    return args
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="DeepEP-HT rank-distribution dispatch/combine benchmark."
     )
+    parser.add_argument(
+        "--model",
+        choices=tuple(MODEL_CONFIGS),
+        help=(
+            "Use a built-in synthetic MoE shape preset. This does not load model "
+            "weights. Explicit shape arguments override the preset."
+        ),
+    )
     parser.add_argument("--tokens", type=int, default=4096)
-    parser.add_argument("--hidden-size", type=int, default=4096)
-    parser.add_argument("--intermediate-size", type=int, default=14336)
-    parser.add_argument("--num-experts", type=int, default=8)
+    parser.add_argument("--hidden-size", type=int)
+    parser.add_argument(
+        "--intermediate-size",
+        type=int,
+        help="Per-routed-expert MoE intermediate size.",
+    )
+    parser.add_argument("--num-experts", type=int)
     parser.add_argument(
         "--top-k",
         type=int,
-        default=1,
         help=(
             "In hot-rank mode, a token routed to multiple ranks is transmitted "
             "multiple times. Local-share mode keeps all top-k experts for a "
@@ -139,7 +185,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Write rank, aggregate, and summary records on rank 0.",
     )
-    return parser.parse_args()
+    return apply_model_config(parser.parse_args())
 
 
 def parse_shares(raw: str, option: str) -> list[float]:
@@ -1068,6 +1114,16 @@ def run_worker(
     all_output_rows: list[dict[str, Any]] = []
     summaries = []
     profile_warmup = len(target_shares) * args.warmup
+    if rank == 0:
+        print(
+            "benchmark_config "
+            f"model={args.model or 'custom'} "
+            f"tokens={args.tokens} "
+            f"hidden_size={args.hidden_size} "
+            f"intermediate_size={args.intermediate_size} "
+            f"num_experts={args.num_experts} "
+            f"top_k={args.top_k}"
+        )
 
     try:
         with set_current_vllm_config(vllm_config):
