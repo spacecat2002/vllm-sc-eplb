@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing as mp
 import os
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,11 +17,12 @@ class CollectionConfig:
     model: str
     prompts: Path | None
     output_dir: Path
-    mode: Literal["train", "eval"]
-    lora_dir: Path
+    mode: Literal["train", "eval", "trace"]
+    lora_dir: Path | None
     epochs: int = 3
     ep_size: int = 1
     max_model_len: int = 4096
+    max_num_batched_tokens: int | None = None
     max_new_tokens: int = 16
     collect_batch_size: int = 1
     timeout: int = 1800
@@ -119,8 +121,7 @@ def _worker(
                 * num_batches
                 * (config.max_model_len + config.max_new_tokens)
             ),
-            # Training and evaluation intentionally do not use vLLM's internal
-            # side-channel LoRA. The external StreamingProcessor owns it.
+            # Collection and external training never alter the real MoE route.
             "VLLM_SC_EPLB": "0",
         }
     )
@@ -128,17 +129,22 @@ def _worker(
 
     from vllm import LLM, SamplingParams
 
+    llm_kwargs: dict[str, object] = {
+        "model": config.model,
+        "tensor_parallel_size": 1,
+        "enable_expert_parallel": True,
+        "max_model_len": config.max_model_len,
+        "max_num_seqs": min(len(indexed_prompts), config.collect_batch_size),
+        "enforce_eager": True,
+        "enable_prefix_caching": False,
+        "enable_return_routed_experts": False,
+        "moe_backend": config.moe_backend,
+        "load_format": config.load_format,
+    }
+    if config.max_num_batched_tokens is not None:
+        llm_kwargs["max_num_batched_tokens"] = config.max_num_batched_tokens
     llm = LLM(
-        model=config.model,
-        tensor_parallel_size=1,
-        enable_expert_parallel=True,
-        max_model_len=config.max_model_len,
-        max_num_seqs=min(len(indexed_prompts), config.collect_batch_size),
-        enforce_eager=True,
-        enable_prefix_caching=False,
-        enable_return_routed_experts=False,
-        moe_backend=config.moe_backend,
-        load_format=config.load_format,
+        **llm_kwargs,
     )
     sampling_params = SamplingParams(temperature=0, max_tokens=config.max_new_tokens)
     generations = []
@@ -195,13 +201,55 @@ def _wait_for_batch(
         time.sleep(0.05)
 
 
+def _archive_trace_batch(
+    record_paths: list[Path],
+    trace_dir: Path,
+    *,
+    epoch: int,
+    batch: int,
+) -> list[Path]:
+    batch_dir = trace_dir / f"epoch_{epoch:04d}" / f"batch_{batch:06d}"
+    destinations = [batch_dir / path.parent.name / path.name for path in record_paths]
+    if len(set(destinations)) != len(destinations):
+        raise ValueError("Trace batch contains duplicate destination paths")
+    existing = next((path for path in destinations if path.exists()), None)
+    if existing is not None:
+        raise FileExistsError(f"Trace destination already exists: {existing}")
+
+    archived = []
+    for path, destination in zip(record_paths, destinations):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        archived.append(path.replace(destination))
+    return archived
+
+
+def _copy_trace_metadata(activation_dir: Path, trace_dir: Path) -> None:
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(
+        activation_dir / "trace_config.json",
+        trace_dir / "trace_config.json",
+    )
+    for rank_dir in sorted(activation_dir.glob("rank_*")):
+        source = rank_dir / "metadata.json"
+        if not source.exists():
+            continue
+        destination = trace_dir / rank_dir.name / "metadata.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+
 def collect(config: CollectionConfig) -> dict:
     if config.ep_size <= 0 or config.collect_batch_size <= 0 or config.epochs <= 0:
         raise ValueError("ep_size, collect_batch_size, and epochs must be positive")
+    if config.max_num_batched_tokens is not None and config.max_num_batched_tokens <= 0:
+        raise ValueError("max_num_batched_tokens must be positive")
+    if config.mode != "trace" and config.lora_dir is None:
+        raise ValueError("lora_dir is required for train and eval modes")
     output_dir = config.output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {output_dir}")
     activation_dir = output_dir / "activations"
+    trace_dir = output_dir / "traces"
     sync_dir = output_dir / "sync"
     result_dir = output_dir / "results"
     for directory in (activation_dir, sync_dir, result_dir):
@@ -251,17 +299,22 @@ def collect(config: CollectionConfig) -> dict:
         process.start()
 
     metrics_dir = output_dir / "metrics"
-    processor = StreamingProcessor(
-        mode=config.mode,
-        output_dir=metrics_dir,
-        lora_dir=config.lora_dir,
-        rank_dim=config.rank_dim,
-        alpha=config.alpha,
-        lr=config.lr,
-        weight_decay=config.weight_decay,
-        seed=config.seed,
-        device=config.device,
-    )
+    processor = None
+    mode = config.mode
+    if mode != "trace":
+        assert config.lora_dir is not None
+        processor = StreamingProcessor(
+            mode=mode,
+            output_dir=metrics_dir,
+            lora_dir=config.lora_dir,
+            rank_dim=config.rank_dim,
+            alpha=config.alpha,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+            seed=config.seed,
+            device=config.device,
+        )
+    num_batches = 0
     try:
         for epoch in range(config.epochs):
             for batch_index in range(max(batch_counts)):
@@ -287,7 +340,16 @@ def collect(config: CollectionConfig) -> dict:
                     raise RuntimeError(
                         f"Epoch {epoch} batch {batch_index} produced no trace records"
                     )
-                processor.process(record_paths, epoch=epoch)
+                if processor is None:
+                    _archive_trace_batch(
+                        record_paths,
+                        trace_dir,
+                        epoch=epoch,
+                        batch=batch_index,
+                    )
+                else:
+                    processor.process(record_paths, epoch=epoch)
+                num_batches += 1
                 for path in ready:
                     path.with_suffix(".ack").write_text("processed", encoding="utf-8")
             epoch_done = [
@@ -295,7 +357,8 @@ def collect(config: CollectionConfig) -> dict:
                 for rank in range(config.ep_size)
             ]
             _wait_for_batch(epoch_done, processes, config.timeout)
-            processor.finish_epoch(epoch)
+            if processor is not None:
+                processor.finish_epoch(epoch)
             for path in epoch_done:
                 path.with_suffix(".ack").write_text("epoch processed", encoding="utf-8")
 
@@ -333,10 +396,14 @@ def collect(config: CollectionConfig) -> dict:
         "num_prompts": len(prompts),
         "epochs": config.epochs,
         "batches_per_epoch": max(batch_counts),
-        "num_batches": processor.batch_index,
-        "lora_dir": str(config.lora_dir),
-        "metrics_dir": str(metrics_dir),
+        "num_batches": num_batches,
     }
+    if processor is None:
+        _copy_trace_metadata(activation_dir, trace_dir)
+        summary["trace_dir"] = str(trace_dir)
+    else:
+        summary["lora_dir"] = str(config.lora_dir)
+        summary["metrics_dir"] = str(metrics_dir)
     (output_dir / "metadata.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )

@@ -66,12 +66,42 @@ must use `VLLM_MOE_TRACE_MODE=lora_training`; count-only
 used by the network.
 
 ```bash
+.venv/bin/python -m moe_gate_lora collect-load \
+  --model Qwen/Qwen3-30B-A3B \
+  --prompts /path/to/prompts.txt \
+  --output-dir /tmp/moe_load_trace \
+  --ep-size 4 \
+  --batch-size 2 \
+  --max-num-batched-tokens 512 \
+  --max-new-tokens 1 \
+  --epochs 1
+
 .venv/bin/python -m moe_gate_lora.load_predictor_example \
-  --trace-dir /tmp/moe_gate_lora/trace \
+  --trace-dir /tmp/moe_load_trace/traces \
   --source-layer 10 \
   --epochs 20 \
   --replica-slots 4
 ```
+
+The collector moves each ready worker batch into a stable hierarchy before
+acknowledging the workers:
+
+```text
+/tmp/moe_load_trace/traces/
+  trace_config.json
+  rank_00000/metadata.json
+  epoch_0000/batch_000000/rank_00000/step_*.pt
+  epoch_0000/batch_000000/rank_00001/step_*.pt
+  epoch_0000/batch_000001/rank_00000/step_*.pt
+```
+
+The output directory must be empty. Full `lora_training` traces include
+activations and router logits and can consume substantial disk space; use one
+collection epoch unless repeated routing samples are explicitly required.
+`--max-num-batched-tokens` controls the scheduler-forward chunk budget; keep it
+at or below 4096 because full training tensors are capped at 4096 traced tokens
+per forward. Use prompts longer than this budget when the experiment needs
+multiple prefill chunks from each request.
 
 The vLLM integration now has five environment variables. The pipeline manages
 the first three and forcibly disables the latter two in its workers:

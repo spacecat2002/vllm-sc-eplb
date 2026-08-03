@@ -54,6 +54,29 @@ def run_pipeline(args: argparse.Namespace) -> None:
     print(f"Saved streaming training and evaluation under {work_dir}")
 
 
+def collect_load_traces(args: argparse.Namespace) -> None:
+    output_dir = args.output_dir.resolve()
+    summary = collect(
+        CollectionConfig(
+            model=args.model,
+            prompts=args.prompts,
+            output_dir=output_dir,
+            mode="trace",
+            lora_dir=None,
+            epochs=args.epochs,
+            ep_size=args.ep_size,
+            max_model_len=args.max_model_len,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_new_tokens=args.max_new_tokens,
+            collect_batch_size=args.batch_size,
+            timeout=args.timeout,
+            load_format=args.load_format,
+            moe_backend=args.moe_backend,
+        )
+    )
+    print(f"Saved load-prediction traces under {summary['trace_dir']}")
+
+
 def refresh_plot(args: argparse.Namespace) -> None:
     payload = json.loads(args.metrics.read_text(encoding="utf-8"))
     output = args.output or args.metrics.with_name("overlap.png")
@@ -61,7 +84,7 @@ def refresh_plot(args: argparse.Namespace) -> None:
     print(f"Saved {output}")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Streaming next-gate LoRA training for vLLM MoE models"
     )
@@ -100,11 +123,38 @@ def parse_args() -> argparse.Namespace:
     pipeline.add_argument("--moe-backend", default="auto")
     pipeline.set_defaults(func=run_pipeline)
 
+    collect_load = subparsers.add_parser(
+        "collect-load",
+        help="Collect and retain full traces for aggregate load prediction.",
+    )
+    collect_load.add_argument("--model", required=True)
+    collect_load.add_argument("--prompts", type=Path)
+    collect_load.add_argument("--output-dir", type=Path, required=True)
+    collect_load.add_argument("--ep-size", type=int, default=1)
+    collect_load.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Prompts per DP-rank inference batch.",
+    )
+    collect_load.add_argument("--max-model-len", type=int, default=4096)
+    collect_load.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        help="Scheduler token budget controlling chunked-prefill forward size.",
+    )
+    collect_load.add_argument("--max-new-tokens", type=int, default=16)
+    collect_load.add_argument("--epochs", type=int, default=1)
+    collect_load.add_argument("--timeout", type=int, default=1800)
+    collect_load.add_argument("--load-format", default="auto")
+    collect_load.add_argument("--moe-backend", default="auto")
+    collect_load.set_defaults(func=collect_load_traces)
+
     plot = subparsers.add_parser("plot")
     plot.add_argument("--metrics", type=Path, required=True)
     plot.add_argument("--output", type=Path)
     plot.set_defaults(func=refresh_plot)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:

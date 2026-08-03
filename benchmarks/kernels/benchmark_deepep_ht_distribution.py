@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark DeepEP-HT dispatch, expert compute, and combine under rank skew.
+"""Benchmark DeepEP-HT dispatch, expert compute, and combine by rank distribution.
 
-Run with torchrun. The benchmark constructs physical top-k expert IDs directly,
-so the fraction of assignments targeting one hot rank is deterministic::
+Run with torchrun. The benchmark constructs physical top-k expert IDs directly.
+Use ``--local-shares`` to keep that fraction of each source rank's tokens on the
+same rank and spread the remainder evenly across the other ranks::
 
     .venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=4 \
         benchmarks/kernels/benchmark_deepep_ht_distribution.py \
+        --local-shares 0,0.25,0.5,0.75,1 \
         --output-jsonl /tmp/deepep_ht_detail.jsonl
 
 Use ``--no-detail-profile`` for wrapper timings without the diagnostic device
@@ -58,7 +60,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="DeepEP-HT hot-rank dispatch/combine benchmark."
+        description="DeepEP-HT rank-distribution dispatch/combine benchmark."
     )
     parser.add_argument("--tokens", type=int, default=4096)
     parser.add_argument("--hidden-size", type=int, default=4096)
@@ -69,16 +71,25 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help=(
-            "Use 1 to keep activation payload constant across hot shares. With "
-            "top-k > 1, a token routed to multiple ranks is transmitted multiple "
-            "times."
+            "In hot-rank mode, a token routed to multiple ranks is transmitted "
+            "multiple times. Local-share mode keeps all top-k experts for a "
+            "token on one rank, so its activation is transmitted at most once."
         ),
     )
     parser.add_argument("--hot-rank", type=int, default=0)
     parser.add_argument(
         "--hot-shares",
-        default="0,0.25,0.5,0.75,1",
+        default=None,
         help="Comma-separated fractions of assignments targeting --hot-rank.",
+    )
+    parser.add_argument(
+        "--local-shares",
+        default=None,
+        help=(
+            "Comma-separated fractions of each source rank's tokens that target "
+            "experts on the same rank. Remaining tokens are spread evenly over "
+            "the other ranks. Mutually exclusive with --hot-shares."
+        ),
     )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
@@ -112,12 +123,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_hot_shares(raw: str) -> list[float]:
+def parse_shares(raw: str, option: str) -> list[float]:
     values = [float(value.strip()) for value in raw.split(",") if value.strip()]
     if not values:
-        raise ValueError("--hot-shares must contain at least one value")
+        raise ValueError(f"{option} must contain at least one value")
     if any(not 0.0 <= value <= 1.0 for value in values):
-        raise ValueError("--hot-shares values must be in [0, 1]")
+        raise ValueError(f"{option} values must be in [0, 1]")
     return values
 
 
@@ -236,6 +247,47 @@ def make_topk_ids(
         source_rank,
         counts,
     ).to(device)
+
+
+def make_locality_topk_ids(
+    *,
+    tokens: int,
+    top_k: int,
+    num_experts: int,
+    source_rank: int,
+    world_size: int,
+    local_share: float,
+    device: torch.device,
+) -> torch.Tensor:
+    num_local_experts = num_experts // world_size
+    if top_k > num_local_experts:
+        raise ValueError(
+            "--local-shares requires at least --top-k experts on every rank"
+        )
+
+    weights = [(1.0 - local_share) / (world_size - 1)] * world_size
+    weights[source_rank] = local_share
+    counts = apportion(tokens, weights, offset=source_rank)
+
+    targets = []
+    remaining = counts[:]
+    while sum(remaining) > 0:
+        for offset in range(world_size):
+            target = (source_rank + offset) % world_size
+            if remaining[target] > 0:
+                targets.append(target)
+                remaining[target] -= 1
+
+    seen_per_rank = [0] * world_size
+    expert_ids = []
+    for target in targets:
+        start = seen_per_rank[target] % num_local_experts
+        seen_per_rank[target] += top_k
+        expert_ids.extend(
+            target * num_local_experts + (start + offset) % num_local_experts
+            for offset in range(top_k)
+        )
+    return torch.tensor(expert_ids, dtype=torch.int64).view(tokens, top_k).to(device)
 
 
 def rank_distribution(
@@ -384,7 +436,8 @@ def run_one_iter(
     tensors: dict[str, torch.Tensor],
     topk_ids: torch.Tensor,
     *,
-    hot_share: float,
+    distribution: str,
+    target_share: float,
     sweep_index: int,
     iteration: int,
     rank: int,
@@ -406,6 +459,7 @@ def run_one_iter(
     )
     remote_assignments = sum(target_assignments) - target_assignments[rank]
     remote_unique_tokens = sum(target_unique_tokens) - target_unique_tokens[rank]
+    actual_local_share = target_unique_tokens[rank] / args.tokens
 
     def prepare():
         return kernel.impl._prepare(
@@ -496,7 +550,10 @@ def run_one_iter(
             )
     return {
         "record_type": "rank",
-        "hot_share": hot_share,
+        "distribution": distribution,
+        "target_share": target_share,
+        "hot_share": target_share if distribution == "hot_rank" else None,
+        "local_share": target_share if distribution == "local_share" else None,
         "iter": iteration,
         "rank": rank,
         "world_size": world_size,
@@ -509,6 +566,7 @@ def run_one_iter(
         "source_target_unique_tokens": target_unique_tokens,
         "remote_assignments": remote_assignments,
         "remote_unique_tokens": remote_unique_tokens,
+        "actual_local_share": actual_local_share,
         "remote_payload_bytes": remote_unique_tokens
         * args.hidden_size
         * hidden_states.element_size(),
@@ -536,6 +594,7 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         combine = [row["combine_ms"] for row in rows]
         totals = [row["total_ms"] for row in rows]
         received = [row["received_tokens"] for row in rows]
+        actual_local_shares = [row["actual_local_share"] for row in rows]
         remote_payload_bytes = sum(row["remote_payload_bytes"] for row in rows)
         remote_unique_tokens = sum(row["remote_unique_tokens"] for row in rows)
         dispatch_row = max(rows, key=lambda row: row["dispatch_ms"])
@@ -565,7 +624,10 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         aggregates.append(
             {
                 "record_type": "aggregate",
+                "distribution": rows[0]["distribution"],
+                "target_share": rows[0]["target_share"],
                 "hot_share": rows[0]["hot_share"],
+                "local_share": rows[0]["local_share"],
                 "iter": iteration,
                 "profile_sample": rows[0]["profile_sample"],
                 "max_dispatch_ms": max(dispatch),
@@ -578,6 +640,8 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "max_total_rank": total_row["rank"],
                 "received_tokens_min": min(received),
                 "received_tokens_max": max(received),
+                "actual_local_share_min": min(actual_local_shares),
+                "actual_local_share_max": max(actual_local_shares),
                 "remote_unique_tokens_total": remote_unique_tokens,
                 "remote_payload_bytes_total": remote_payload_bytes,
                 "detail_max_ms": detail_max_ms,
@@ -607,13 +671,17 @@ def summarize(aggregates: list[dict[str, Any]], trim_ratio: float) -> dict[str, 
         row_phases = set(row["detail_max_ms"])
         if row_phases != set(detail_phase_names):
             raise RuntimeError(
-                "DeepEP-HT detail phases differ across iterations for hot_share "
-                f"{row['hot_share']}: iteration {row['iter']} has "
+                "DeepEP-HT detail phases differ across iterations for "
+                f"{row['distribution']}={row['target_share']}: iteration "
+                f"{row['iter']} has "
                 f"{sorted(row_phases)}, expected {detail_phase_names}"
             )
     return {
         "record_type": "summary",
+        "distribution": aggregates[0]["distribution"],
+        "target_share": aggregates[0]["target_share"],
         "hot_share": aggregates[0]["hot_share"],
+        "local_share": aggregates[0]["local_share"],
         "iters": len(aggregates),
         "trimmed_iters": len(kept),
         "dispatch_ms": statistics.mean(row["max_dispatch_ms"] for row in kept),
@@ -622,6 +690,8 @@ def summarize(aggregates: list[dict[str, Any]], trim_ratio: float) -> dict[str, 
         "total_ms": statistics.mean(row["max_total_ms"] for row in kept),
         "received_tokens_min": min(row["received_tokens_min"] for row in kept),
         "received_tokens_max": max(row["received_tokens_max"] for row in kept),
+        "actual_local_share_min": min(row["actual_local_share_min"] for row in kept),
+        "actual_local_share_max": max(row["actual_local_share_max"] for row in kept),
         "remote_unique_tokens": statistics.mean(
             row["remote_unique_tokens_total"] for row in kept
         ),
@@ -640,8 +710,8 @@ def summarize(aggregates: list[dict[str, Any]], trim_ratio: float) -> dict[str, 
 
 def print_summaries(summaries: list[dict[str, Any]]) -> None:
     print(
-        "hot_share dispatch_ms compute_ms combine_ms total_ms "
-        "recv_min recv_max remote_tokens remote_mib detail_samples"
+        "distribution share actual_local dispatch_ms compute_ms combine_ms "
+        "total_ms recv_min recv_max remote_tokens remote_mib detail_samples"
     )
     for row in summaries:
         sample_range = (
@@ -650,7 +720,10 @@ def print_summaries(summaries: list[dict[str, Any]]) -> None:
             else "disabled"
         )
         print(
-            f"{row['hot_share']:>9.3f} "
+            f"{row['distribution']:>12} "
+            f"{row['target_share']:>5.3f} "
+            f"{row['actual_local_share_min']:>5.3f}:"
+            f"{row['actual_local_share_max']:<5.3f} "
             f"{row['dispatch_ms']:>11.3f} "
             f"{row['compute_ms']:>10.3f} "
             f"{row['combine_ms']:>10.3f} "
@@ -677,13 +750,13 @@ def print_summaries(summaries: list[dict[str, Any]]) -> None:
     if any(row["detail_phase_ms"] for row in summaries):
         print()
         print("DeepEP-HT detail: mean of the per-iteration max rank (ms)")
-        print("hot_share " + " ".join(detail_phases))
+        print("distribution share " + " ".join(detail_phases))
         for row in summaries:
             timings = row["detail_phase_ms"]
             values = " ".join(
                 f"{timings.get(phase, 0.0):.4f}" for phase in detail_phases
             )
-            print(f"{row['hot_share']:.3f} {values}")
+            print(f"{row['distribution']} {row['target_share']:.3f} {values}")
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -693,7 +766,11 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             output.write(json.dumps(row, sort_keys=True) + "\n")
 
 
-def run_worker(args: argparse.Namespace, hot_shares: list[float]) -> None:
+def run_worker(
+    args: argparse.Namespace,
+    distribution: str,
+    target_shares: list[float],
+) -> None:
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -720,7 +797,7 @@ def run_worker(args: argparse.Namespace, hot_shares: list[float]) -> None:
     vllm_config = make_vllm_config(world_size, rank, local_rank)
     all_output_rows: list[dict[str, Any]] = []
     summaries = []
-    profile_warmup = len(hot_shares) * args.warmup
+    profile_warmup = len(target_shares) * args.warmup
 
     try:
         with set_current_vllm_config(vllm_config):
@@ -744,27 +821,42 @@ def run_worker(args: argparse.Namespace, hot_shares: list[float]) -> None:
                 num_tokens=args.tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
             ):
-                sweep_topk_ids = [
-                    make_topk_ids(
-                        tokens=args.tokens,
-                        top_k=args.top_k,
-                        num_experts=args.num_experts,
-                        source_rank=rank,
-                        world_size=world_size,
-                        hot_rank=args.hot_rank,
-                        hot_share=hot_share,
-                        device=device,
-                    )
-                    for hot_share in hot_shares
-                ]
-                for hot_share, topk_ids in zip(hot_shares, sweep_topk_ids):
+                if distribution == "local_share":
+                    sweep_topk_ids = [
+                        make_locality_topk_ids(
+                            tokens=args.tokens,
+                            top_k=args.top_k,
+                            num_experts=args.num_experts,
+                            source_rank=rank,
+                            world_size=world_size,
+                            local_share=target_share,
+                            device=device,
+                        )
+                        for target_share in target_shares
+                    ]
+                else:
+                    sweep_topk_ids = [
+                        make_topk_ids(
+                            tokens=args.tokens,
+                            top_k=args.top_k,
+                            num_experts=args.num_experts,
+                            source_rank=rank,
+                            world_size=world_size,
+                            hot_rank=args.hot_rank,
+                            hot_share=target_share,
+                            device=device,
+                        )
+                        for target_share in target_shares
+                    ]
+                for target_share, topk_ids in zip(target_shares, sweep_topk_ids):
                     for _ in range(args.warmup):
                         run_one_iter(
                             args,
                             kernel,
                             tensors,
                             topk_ids,
-                            hot_share=hot_share,
+                            distribution=distribution,
+                            target_share=target_share,
                             sweep_index=-1,
                             iteration=-1,
                             rank=rank,
@@ -774,8 +866,8 @@ def run_worker(args: argparse.Namespace, hot_shares: list[float]) -> None:
                         )
                 dist.barrier()
 
-                for sweep_index, (hot_share, topk_ids) in enumerate(
-                    zip(hot_shares, sweep_topk_ids)
+                for sweep_index, (target_share, topk_ids) in enumerate(
+                    zip(target_shares, sweep_topk_ids)
                 ):
                     local_rows = [
                         run_one_iter(
@@ -783,7 +875,8 @@ def run_worker(args: argparse.Namespace, hot_shares: list[float]) -> None:
                             kernel,
                             tensors,
                             topk_ids,
-                            hot_share=hot_share,
+                            distribution=distribution,
+                            target_share=target_share,
                             sweep_index=sweep_index,
                             iteration=iteration,
                             rank=rank,
@@ -820,7 +913,15 @@ def run_worker(args: argparse.Namespace, hot_shares: list[float]) -> None:
 
 def main() -> None:
     args = parse_args()
-    hot_shares = parse_hot_shares(args.hot_shares)
+    if args.hot_shares is not None and args.local_shares is not None:
+        raise ValueError("--hot-shares and --local-shares are mutually exclusive")
+    if args.local_shares is not None:
+        distribution = "local_share"
+        target_shares = parse_shares(args.local_shares, "--local-shares")
+    else:
+        distribution = "hot_rank"
+        raw_hot_shares = args.hot_shares or "0,0.25,0.5,0.75,1"
+        target_shares = parse_shares(raw_hot_shares, "--hot-shares")
     if args.iters <= 0 or args.warmup < 0:
         raise ValueError("--iters must be positive and --warmup non-negative")
     if (
@@ -845,11 +946,15 @@ def main() -> None:
     if args.detail_profile:
         os.environ["VLLM_DEEPEP_HT_PROFILE"] = "1"
         os.environ["VLLM_DEEPEP_HT_PROFILE_LOG"] = "0"
-        os.environ["VLLM_DEEPEP_HT_PROFILE_WARMUP"] = str(len(hot_shares) * args.warmup)
-        os.environ["VLLM_DEEPEP_HT_PROFILE_SAMPLES"] = str(len(hot_shares) * args.iters)
+        os.environ["VLLM_DEEPEP_HT_PROFILE_WARMUP"] = str(
+            len(target_shares) * args.warmup
+        )
+        os.environ["VLLM_DEEPEP_HT_PROFILE_SAMPLES"] = str(
+            len(target_shares) * args.iters
+        )
     else:
         os.environ["VLLM_DEEPEP_HT_PROFILE"] = "0"
-    run_worker(args, hot_shares)
+    run_worker(args, distribution, target_shares)
 
 
 if __name__ == "__main__":
