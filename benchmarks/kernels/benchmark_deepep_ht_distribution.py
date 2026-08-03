@@ -718,10 +718,12 @@ def run_local_bypass_iter(
         )
 
     def compute():
-        return (
-            compute_batch(local_kernel, local_batch),
-            compute_batch(deepep_kernel, remote_batch),
-        )
+        local_fused_out = compute_batch(local_kernel, local_batch)
+        if local_fused_out is not None and remote_batch is not None:
+            # Both kernels reuse the process-wide MoE workspace.
+            local_fused_out = local_fused_out.clone()
+        remote_fused_out = compute_batch(deepep_kernel, remote_batch)
+        return local_fused_out, remote_fused_out
 
     (local_fused_out, remote_fused_out), compute_ms = time_stage(
         device,
