@@ -931,7 +931,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     collect_parser.add_argument("--max-new-tokens", type=int, default=16)
     collect_parser.add_argument("--timeout", type=int, default=1800)
     collect_parser.add_argument("--load-format", default="auto")
-    collect_parser.add_argument("--moe-backend", default="auto")
+    collect_parser.add_argument("--moe-backend", default="triton")
     _add_plot_filters(collect_parser)
     collect_parser.set_defaults(func=collect)
 
