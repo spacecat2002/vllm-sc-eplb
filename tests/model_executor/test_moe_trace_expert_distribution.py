@@ -8,6 +8,7 @@ import torch
 from examples.basic.offline_inference.moe_trace_expert_distribution import (
     _aggregate_trace,
     _load_datasets,
+    _local_expert_ids,
     _sort_expert_counts,
     _top_n_expert_coverage,
     _validate_top_n_experts,
@@ -61,6 +62,8 @@ def test_trace_aggregation_sums_ranks_per_step_and_steps_per_rank(tmp_path):
         json.dumps(
             {
                 "num_experts": 3,
+                "ep_size": 2,
+                "expert_placement_strategy": "linear",
                 "request_batches": {
                     "0:request-0": 0,
                     "0:request-1": 0,
@@ -114,6 +117,8 @@ def test_trace_aggregation_sums_ranks_per_step_and_steps_per_rank(tmp_path):
 
     distribution = _aggregate_trace(experiment_dir)
 
+    assert distribution.ep_size == 2
+    assert distribution.expert_placement_strategy == "linear"
     layer = distribution.layers[4]
     np.testing.assert_array_equal(layer.totals, [4, 3, 2])
     np.testing.assert_array_equal(layer.rank_totals[0], [3, 3, 1])
@@ -133,24 +138,49 @@ def test_expert_counts_are_sorted_descending_with_stable_expert_ids():
 
 
 def test_top_n_expert_coverage_counts_token_expert_assignments():
-    coverage = _top_n_expert_coverage(np.asarray([4, 7, 7, 0, 2]), [1, 3, 5])
+    coverage = _top_n_expert_coverage(
+        np.asarray([4, 7, 7, 0, 2]),
+        [1, 3, 5],
+        _local_expert_ids(num_experts=5, ep_size=2, rank=0),
+    )
 
     assert coverage[1] == {
         "selected_expert_ids": [1],
         "token_expert_assignments": 7,
         "assignment_share_percent": 35.0,
+        "local_expert_ids": [1],
+        "local_expert_count": 1,
+        "local_expert_share_percent": 100.0,
     }
     assert coverage[3]["selected_expert_ids"] == [1, 2, 0]
     assert coverage[3]["token_expert_assignments"] == 18
     assert coverage[3]["assignment_share_percent"] == 90.0
+    assert coverage[3]["local_expert_ids"] == [1, 2, 0]
+    assert coverage[3]["local_expert_count"] == 3
+    assert coverage[3]["local_expert_share_percent"] == 100.0
     assert coverage[5]["token_expert_assignments"] == 20
     assert coverage[5]["assignment_share_percent"] == 100.0
+    assert coverage[5]["local_expert_ids"] == [1, 2, 0]
+    assert coverage[5]["local_expert_count"] == 3
+    assert coverage[5]["local_expert_share_percent"] == 60.0
 
 
 def test_top_n_experts_are_deduplicated_and_range_checked():
     assert _validate_top_n_experts([3, 1, 3], 4) == [3, 1]
     with pytest.raises(ValueError, match="must be in"):
         _validate_top_n_experts([0, 5], 4)
+
+
+def test_local_expert_ids_match_linear_placement_with_remainder():
+    assert _local_expert_ids(num_experts=10, ep_size=3, rank=0) == {0, 1, 2, 3}
+    assert _local_expert_ids(num_experts=10, ep_size=3, rank=1) == {4, 5, 6}
+    assert _local_expert_ids(num_experts=10, ep_size=3, rank=2) == {7, 8, 9}
+    assert _local_expert_ids(
+        num_experts=10,
+        ep_size=3,
+        rank=1,
+        placement_strategy="round_robin",
+    ) == {1, 4, 7}
 
 
 def test_trace_preserves_scheduled_count_when_tensors_are_truncated(tmp_path):

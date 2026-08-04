@@ -53,6 +53,8 @@ class LayerDistribution:
 @dataclass
 class TraceDistribution:
     num_experts: int
+    ep_size: int
+    expert_placement_strategy: str
     layers: dict[int, LayerDistribution]
 
 
@@ -372,6 +374,7 @@ def _collect_experiment(
         "dataset": dataset_name,
         "batch_size_per_rank": batch_size,
         "ep_size": args.ep_size,
+        "expert_placement_strategy": "linear",
         "num_prompts": len(prompts),
         "num_experts": expert_counts.pop(),
         "max_new_tokens": args.max_new_tokens,
@@ -486,7 +489,19 @@ def _aggregate_trace(experiment_dir: Path) -> TraceDistribution:
                 if count_layer == layer
             },
         )
-    return TraceDistribution(num_experts, layers)
+    traced_ranks = sorted(rank for rank, _ in rank_counts)
+    inferred_ep_size = traced_ranks[-1] + 1
+    ep_size = int(metadata.get("ep_size", inferred_ep_size))
+    if ep_size < inferred_ep_size:
+        raise ValueError(
+            f"Trace contains rank {traced_ranks[-1]}, but metadata ep_size is {ep_size}"
+        )
+    placement_strategy = str(metadata.get("expert_placement_strategy", "linear"))
+    if placement_strategy not in ("linear", "round_robin"):
+        raise ValueError(
+            f"Unsupported expert placement strategy: {placement_strategy!r}"
+        )
+    return TraceDistribution(num_experts, ep_size, placement_strategy, layers)
 
 
 def _sort_expert_counts(counts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -505,21 +520,61 @@ def _validate_top_n_experts(values: list[int], num_experts: int) -> list[int]:
     return values
 
 
+def _local_expert_ids(
+    num_experts: int,
+    ep_size: int,
+    rank: int,
+    placement_strategy: str = "linear",
+) -> set[int]:
+    if ep_size <= 0:
+        raise ValueError(f"ep_size must be positive, got {ep_size}")
+    if not 0 <= rank < ep_size:
+        raise ValueError(f"rank must be in [0, {ep_size}), got {rank}")
+    if placement_strategy == "round_robin":
+        return set(range(rank, num_experts, ep_size))
+    if placement_strategy != "linear":
+        raise ValueError(
+            f"Unsupported expert placement strategy: {placement_strategy!r}"
+        )
+    base_experts, remainder = divmod(num_experts, ep_size)
+    local_num_experts = base_experts + int(rank < remainder)
+    start = rank * base_experts + min(rank, remainder)
+    return set(range(start, start + local_num_experts))
+
+
 def _top_n_expert_coverage(
-    counts: np.ndarray, top_n_experts: list[int]
+    counts: np.ndarray,
+    top_n_experts: list[int],
+    local_expert_ids: set[int] | None = None,
 ) -> dict[int, dict[str, Any]]:
     expert_ids, sorted_counts = _sort_expert_counts(counts)
     total = int(sorted_counts.sum())
     coverage = {}
     for top_n in top_n_experts:
         assignment_count = int(sorted_counts[:top_n].sum())
-        coverage[top_n] = {
+        metrics = {
             "selected_expert_ids": expert_ids[:top_n].tolist(),
             "token_expert_assignments": assignment_count,
             "assignment_share_percent": (
                 assignment_count / total * 100.0 if total else 0.0
             ),
         }
+        if local_expert_ids is not None:
+            selected_local_ids = [
+                expert_id
+                for expert_id in metrics["selected_expert_ids"]
+                if expert_id in local_expert_ids
+            ]
+            metrics.update(
+                {
+                    "local_expert_ids": selected_local_ids,
+                    "local_expert_count": len(selected_local_ids),
+                    "local_expert_share_percent": (
+                        len(selected_local_ids) / top_n * 100.0
+                    ),
+                }
+            )
+        coverage[top_n] = metrics
     return coverage
 
 
@@ -569,12 +624,18 @@ def _write_distribution_data(
                 ranks = {}
                 for rank, rank_counts in layer_distribution.rank_totals.items():
                     expert_ids, sorted_counts = _sort_expert_counts(rank_counts)
+                    local_expert_ids = _local_expert_ids(
+                        distribution.num_experts,
+                        distribution.ep_size,
+                        rank,
+                        distribution.expert_placement_strategy,
+                    )
                     ranks[str(rank)] = {
                         "total_token_expert_assignments": int(rank_counts.sum()),
                         "expert_ids_descending": expert_ids.tolist(),
                         "expert_counts_descending": sorted_counts.tolist(),
                         "top_n_expert_coverage": _top_n_expert_coverage(
-                            rank_counts, top_n_experts
+                            rank_counts, top_n_experts, local_expert_ids
                         ),
                     }
                 layers[str(layer)] = {
@@ -603,6 +664,10 @@ def _write_distribution_data(
                     "dataset": dataset,
                     "batch_size_per_rank": batch_size,
                     "num_experts": distribution.num_experts,
+                    "ep_size": distribution.ep_size,
+                    "expert_placement_strategy": (
+                        distribution.expert_placement_strategy
+                    ),
                     "layers": layers,
                 }
             )
@@ -739,7 +804,15 @@ def _plot_distributions(
                 outputs.append(output)
                 for rank, rank_counts in layer_distribution.rank_totals.items():
                     expert_ids, sorted_counts = _sort_expert_counts(rank_counts)
-                    coverage = _top_n_expert_coverage(rank_counts, top_n_experts)
+                    local_expert_ids = _local_expert_ids(
+                        distribution.num_experts,
+                        distribution.ep_size,
+                        rank,
+                        distribution.expert_placement_strategy,
+                    )
+                    coverage = _top_n_expert_coverage(
+                        rank_counts, top_n_experts, local_expert_ids
+                    )
                     fig, axis = plt.subplots(figsize=(16, 6))
                     positions = np.arange(num_experts)
                     axis.bar(
@@ -764,7 +837,8 @@ def _plot_distributions(
                         coverage_text = "\n".join(
                             f"Top-{top_n}: "
                             f"{metrics['token_expert_assignments']:,} "
-                            f"({metrics['assignment_share_percent']:.2f}%)"
+                            f"({metrics['assignment_share_percent']:.2f}%), "
+                            f"local {metrics['local_expert_count']}/{top_n}"
                             for top_n, metrics in coverage.items()
                         )
                         axis.text(
@@ -787,7 +861,9 @@ def _plot_distributions(
                             + ", ".join(
                                 f"top_{top_n}="
                                 f"{metrics['token_expert_assignments']} "
-                                f"({metrics['assignment_share_percent']:.2f}%)"
+                                f"({metrics['assignment_share_percent']:.2f}%), "
+                                f"local_experts="
+                                f"{metrics['local_expert_count']}/{top_n}"
                                 for top_n, metrics in coverage.items()
                             )
                         )
@@ -832,6 +908,7 @@ def collect(args: argparse.Namespace) -> None:
         "model": args.model,
         "datasets": list(datasets),
         "batch_sizes": args.batch_sizes,
+        "expert_placement_strategy": "linear",
         "num_prompts_per_dataset": args.num_prompts,
         "experiments": [],
     }

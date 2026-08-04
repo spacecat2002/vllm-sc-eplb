@@ -179,6 +179,15 @@ all assignments on that rank. Because count-only traces do not retain per-token
 top-k combinations, this is not a count of unique tokens that hit at least one
 selected expert.
 
+For every Top-N value, the same record also reports how many selected experts
+are local to that rank: `local_expert_count`, `local_expert_share_percent`, and
+`local_expert_ids`. Expert ownership follows vLLM's configured placement
+strategy. New collections store `expert_placement_strategy`; existing traces
+without that field are interpreted as the default `linear` placement. With
+EPLB or redundant physical experts, logical trace IDs are insufficient to
+reconstruct the dynamic physical placement, so these local-expert fields should
+not be used as physical EPLB placement metrics.
+
 All three panels use the same model-forward index on the x axis. This is a
 contiguous `0..N-1` index over the recorded forwards, not the outer batch index
 and not a token position. The dashed vertical lines mark changes in the outer
@@ -198,5 +207,7 @@ counts and percentages for every expert and layer. Its per-rank entries include
 expert IDs and counts in the same descending order as the rank-total plots.
 When `--top-n-experts` is provided, `top_n_expert_coverage` stores the selected
 expert IDs, covered assignment count, and coverage percentage for each N.
+Per-rank entries additionally store the selected local expert IDs and their
+count and percentage within Top-N.
 This aggregate is useful for quantitative checks; the plots emphasize changes
 over scheduler forwards.
