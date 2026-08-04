@@ -42,6 +42,7 @@ This example compares all four datasets at batch sizes 1, 2, 4, and 8, using
   --ep-size 4 \
   --max-new-tokens 16 \
   --layers 23 \
+  --top-n-experts 8 16 32 \
   --output-dir /tmp/qwen3_expert_distribution
 ```
 
@@ -63,12 +64,13 @@ Each dataset/batch-size combination starts new vLLM workers and is stored at:
 ```
 
 If `--layers` is omitted, the script plots only the first common MoE layer, so
-each dataset/batch-size combination produces exactly one PNG. The example
-above produces separate files such as
+each dataset/batch-size combination produces one forward-series PNG and one
+rank-total PNG per EP rank. The example above produces separate files such as
 `expert_distribution_math_batch_0001_layer_0023.png` and
-`expert_distribution_math_batch_0008_layer_0023.png`; datasets and batch sizes
-never share a figure. Passing multiple layer IDs explicitly produces one file
-per layer. To redraw selected combinations without running inference again:
+`expert_counts_math_batch_0001_layer_0023_rank_00000.png`. Datasets, batch
+sizes, layers, and ranks never share a figure. Passing multiple layer IDs
+explicitly produces both kinds of plot for every requested layer. To redraw
+selected combinations without running inference again:
 
 ```bash
 .venv/bin/python \
@@ -77,6 +79,7 @@ per layer. To redraw selected combinations without running inference again:
   --datasets math code \
   --batch-sizes 1 8 \
   --layers 23 \
+  --top-n-experts 8 16 32 \
   --max-steps 100
 ```
 
@@ -161,6 +164,21 @@ logical expert ID. Expert colors are deterministic and remain identical
 across every dataset and batch-size figure. IDs are captured before EPLB
 logical-to-physical remapping.
 
+Each rank-total figure separately sums all forward steps for one rank and one
+layer, then sorts bars by assignment count from largest to smallest. The x-axis
+labels retain the original logical expert IDs. Ties are ordered by expert ID.
+Layers are never combined because the same logical ID in two layers identifies
+different experts. The counts are token-expert assignments: with top-k routing,
+one token contributes once to every selected expert.
+
+Passing `--top-n-experts 8 16 32` also reports cumulative coverage for the 8,
+16, and 32 most-loaded experts. For each rank and layer, experts are selected
+from the same trace-wide descending order used by the bars. The plot annotation
+and console output show both the covered assignment count and its percentage of
+all assignments on that rank. Because count-only traces do not retain per-token
+top-k combinations, this is not a count of unique tokens that hit at least one
+selected expert.
+
 All three panels use the same model-forward index on the x axis. This is a
 contiguous `0..N-1` index over the recorded forwards, not the outer batch index
 and not a token position. The dashed vertical lines mark changes in the outer
@@ -176,5 +194,9 @@ runs.
 Alongside PNG files, `expert_distribution.json` stores forward indices, the
 corresponding raw model-forward steps and batch indices, the per-forward
 `max_over_mean` and `scheduled_token_counts` series, plus total assignment
-counts and percentages for every expert and layer. This aggregate is useful
-for quantitative checks; the plots emphasize changes over scheduler forwards.
+counts and percentages for every expert and layer. Its per-rank entries include
+expert IDs and counts in the same descending order as the rank-total plots.
+When `--top-n-experts` is provided, `top_n_expert_coverage` stores the selected
+expert IDs, covered assignment count, and coverage percentage for each N.
+This aggregate is useful for quantitative checks; the plots emphasize changes
+over scheduler forwards.

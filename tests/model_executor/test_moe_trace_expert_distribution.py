@@ -8,6 +8,9 @@ import torch
 from examples.basic.offline_inference.moe_trace_expert_distribution import (
     _aggregate_trace,
     _load_datasets,
+    _sort_expert_counts,
+    _top_n_expert_coverage,
+    _validate_top_n_experts,
 )
 from vllm.model_executor.layers.fused_moe.moe_trace import (
     MoETraceCollector,
@@ -50,7 +53,7 @@ def test_local_dataset_overrides_preserve_domain_prompt_format(tmp_path):
     assert prompts[1] == "Compute 2 + 2"
 
 
-def test_trace_aggregation_sums_ranks_before_normalizing(tmp_path):
+def test_trace_aggregation_sums_ranks_per_step_and_steps_per_rank(tmp_path):
     experiment_dir = tmp_path / "dataset_math" / "batch_0002"
     (experiment_dir / "activations" / "rank_00000").mkdir(parents=True)
     (experiment_dir / "activations" / "rank_00001").mkdir(parents=True)
@@ -61,6 +64,7 @@ def test_trace_aggregation_sums_ranks_before_normalizing(tmp_path):
                 "request_batches": {
                     "0:request-0": 0,
                     "0:request-1": 0,
+                    "0:request-3": 1,
                     "1:request-2": 0,
                 },
             }
@@ -70,22 +74,31 @@ def test_trace_aggregation_sums_ranks_before_normalizing(tmp_path):
     records = [
         (
             0,
+            0,
             torch.tensor([2, 1, 1], dtype=torch.int64),
             2,
             ["request-0", "request-1"],
         ),
         (
             1,
+            0,
             torch.tensor([1, 0, 1], dtype=torch.int64),
             1,
             ["request-2"],
         ),
+        (
+            0,
+            1,
+            torch.tensor([1, 2, 0], dtype=torch.int64),
+            1,
+            ["request-3"],
+        ),
     ]
-    for rank, expert_counts, num_scheduled_tokens, request_ids in records:
+    for rank, step, expert_counts, num_scheduled_tokens, request_ids in records:
         record = {
             "mode": "expert_distribution",
             "rank": rank,
-            "step": 0,
+            "step": step,
             "layer_id": 4,
             "expert_counts": expert_counts,
             "num_scheduled_tokens": num_scheduled_tokens,
@@ -95,18 +108,49 @@ def test_trace_aggregation_sums_ranks_before_normalizing(tmp_path):
             experiment_dir
             / "activations"
             / f"rank_{rank:05d}"
-            / "step_000000_layer_0004.pt"
+            / f"step_{step:06d}_layer_0004.pt"
         )
         torch.save(record, path)
 
     distribution = _aggregate_trace(experiment_dir)
 
     layer = distribution.layers[4]
-    np.testing.assert_array_equal(layer.totals, [3, 1, 2])
+    np.testing.assert_array_equal(layer.totals, [4, 3, 2])
+    np.testing.assert_array_equal(layer.rank_totals[0], [3, 3, 1])
+    np.testing.assert_array_equal(layer.rank_totals[1], [1, 0, 1])
     np.testing.assert_allclose(layer.shares[0], [50.0, 100 / 6, 100 / 3])
-    np.testing.assert_array_equal(layer.batch_indices, [0])
-    np.testing.assert_allclose(layer.imbalance, [1.5])
-    np.testing.assert_array_equal(layer.scheduled_tokens, [3])
+    np.testing.assert_allclose(layer.shares[1], [100 / 3, 200 / 3, 0])
+    np.testing.assert_array_equal(layer.batch_indices, [0, 1])
+    np.testing.assert_allclose(layer.imbalance, [1.5, 2.0])
+    np.testing.assert_array_equal(layer.scheduled_tokens, [3, 1])
+
+
+def test_expert_counts_are_sorted_descending_with_stable_expert_ids():
+    expert_ids, counts = _sort_expert_counts(np.asarray([4, 7, 7, 0, 2]))
+
+    np.testing.assert_array_equal(expert_ids, [1, 2, 0, 4, 3])
+    np.testing.assert_array_equal(counts, [7, 7, 4, 2, 0])
+
+
+def test_top_n_expert_coverage_counts_token_expert_assignments():
+    coverage = _top_n_expert_coverage(np.asarray([4, 7, 7, 0, 2]), [1, 3, 5])
+
+    assert coverage[1] == {
+        "selected_expert_ids": [1],
+        "token_expert_assignments": 7,
+        "assignment_share_percent": 35.0,
+    }
+    assert coverage[3]["selected_expert_ids"] == [1, 2, 0]
+    assert coverage[3]["token_expert_assignments"] == 18
+    assert coverage[3]["assignment_share_percent"] == 90.0
+    assert coverage[5]["token_expert_assignments"] == 20
+    assert coverage[5]["assignment_share_percent"] == 100.0
+
+
+def test_top_n_experts_are_deduplicated_and_range_checked():
+    assert _validate_top_n_experts([3, 1, 3], 4) == [3, 1]
+    with pytest.raises(ValueError, match="must be in"):
+        _validate_top_n_experts([0, 5], 4)
 
 
 def test_trace_preserves_scheduled_count_when_tensors_are_truncated(tmp_path):

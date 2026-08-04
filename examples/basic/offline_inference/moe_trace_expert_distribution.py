@@ -47,6 +47,7 @@ class LayerDistribution:
     imbalance: np.ndarray
     scheduled_tokens: np.ndarray
     totals: np.ndarray
+    rank_totals: dict[int, np.ndarray]
 
 
 @dataclass
@@ -396,6 +397,7 @@ def _aggregate_trace(experiment_dir: Path) -> TraceDistribution:
     num_experts = int(metadata.get("num_experts", 0))
     request_batches = metadata.get("request_batches", {})
     counts: dict[tuple[int, int], np.ndarray] = {}
+    rank_counts: dict[tuple[int, int], np.ndarray] = {}
     scheduled_tokens: dict[tuple[int, int], int] = {}
     batches: dict[tuple[int, int], set[int]] = {}
     paths = sorted((experiment_dir / "activations").glob("rank_*/step_*_layer_*.pt"))
@@ -421,6 +423,10 @@ def _aggregate_trace(experiment_dir: Path) -> TraceDistribution:
             ids = ids[(ids >= 0) & (ids < num_experts)]
             value = np.bincount(ids, minlength=num_experts).astype(np.int64)
         counts[key] = counts.get(key, np.zeros(num_experts, dtype=np.int64)) + value
+        rank_key = rank, layer
+        rank_counts[rank_key] = (
+            rank_counts.get(rank_key, np.zeros(num_experts, dtype=np.int64)) + value
+        )
         recorded_tokens = record["topk_ids"].shape[0] if "topk_ids" in record else 0
         scheduled_tokens[key] = scheduled_tokens.get(key, 0) + int(
             record.get("num_scheduled_tokens", recorded_tokens)
@@ -474,8 +480,47 @@ def _aggregate_trace(experiment_dir: Path) -> TraceDistribution:
                 dtype=np.int64,
             ),
             totals=layer_counts.sum(axis=0),
+            rank_totals={
+                rank: rank_counts[(rank, layer)]
+                for rank, count_layer in sorted(rank_counts)
+                if count_layer == layer
+            },
         )
     return TraceDistribution(num_experts, layers)
+
+
+def _sort_expert_counts(counts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    expert_ids = np.arange(len(counts), dtype=np.int64)
+    order = np.lexsort((expert_ids, -counts))
+    return expert_ids[order], counts[order]
+
+
+def _validate_top_n_experts(values: list[int], num_experts: int) -> list[int]:
+    values = list(dict.fromkeys(values))
+    invalid = [value for value in values if not 1 <= value <= num_experts]
+    if invalid:
+        raise ValueError(
+            f"--top-n-experts values must be in [1, {num_experts}], got {invalid}"
+        )
+    return values
+
+
+def _top_n_expert_coverage(
+    counts: np.ndarray, top_n_experts: list[int]
+) -> dict[int, dict[str, Any]]:
+    expert_ids, sorted_counts = _sort_expert_counts(counts)
+    total = int(sorted_counts.sum())
+    coverage = {}
+    for top_n in top_n_experts:
+        assignment_count = int(sorted_counts[:top_n].sum())
+        coverage[top_n] = {
+            "selected_expert_ids": expert_ids[:top_n].tolist(),
+            "token_expert_assignments": assignment_count,
+            "assignment_share_percent": (
+                assignment_count / total * 100.0 if total else 0.0
+            ),
+        }
+    return coverage
 
 
 def _categorical_expert_colors(num_experts: int) -> np.ndarray:
@@ -511,6 +556,7 @@ def _write_distribution_data(
     datasets: list[str],
     batch_sizes: list[int],
     distributions: dict[tuple[str, int], TraceDistribution],
+    top_n_experts: list[int],
 ) -> Path:
     experiments = []
     for dataset in datasets:
@@ -520,6 +566,17 @@ def _write_distribution_data(
             for layer, layer_distribution in distribution.layers.items():
                 counts = layer_distribution.totals
                 total = int(counts.sum())
+                ranks = {}
+                for rank, rank_counts in layer_distribution.rank_totals.items():
+                    expert_ids, sorted_counts = _sort_expert_counts(rank_counts)
+                    ranks[str(rank)] = {
+                        "total_token_expert_assignments": int(rank_counts.sum()),
+                        "expert_ids_descending": expert_ids.tolist(),
+                        "expert_counts_descending": sorted_counts.tolist(),
+                        "top_n_expert_coverage": _top_n_expert_coverage(
+                            rank_counts, top_n_experts
+                        ),
+                    }
                 layers[str(layer)] = {
                     "num_forward_steps": int(len(layer_distribution.raw_steps)),
                     "forward_indices": list(range(len(layer_distribution.raw_steps))),
@@ -536,6 +593,10 @@ def _write_distribution_data(
                         if total
                         else [0.0] * distribution.num_experts
                     ),
+                    "top_n_expert_coverage": _top_n_expert_coverage(
+                        counts, top_n_experts
+                    ),
+                    "ranks": ranks,
                 }
             experiments.append(
                 {
@@ -560,6 +621,7 @@ def _plot_distributions(
     batch_sizes: list[int],
     requested_layers: list[int] | None,
     max_steps: int | None,
+    top_n_experts: list[int],
 ) -> list[Path]:
     import matplotlib.pyplot as plt
     from matplotlib.ticker import MaxNLocator
@@ -577,6 +639,7 @@ def _plot_distributions(
     if len(expert_sizes) != 1:
         raise ValueError("Experiments have different numbers of experts")
     num_experts = expert_sizes.pop()
+    top_n_experts = _validate_top_n_experts(top_n_experts, num_experts)
     colors = _categorical_expert_colors(num_experts)
     layers = _selected_layers(distributions, requested_layers)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -674,7 +737,77 @@ def _plot_distributions(
                 fig.savefig(output, dpi=200, bbox_inches="tight")
                 plt.close(fig)
                 outputs.append(output)
-    _write_distribution_data(work_dir, datasets, batch_sizes, distributions)
+                for rank, rank_counts in layer_distribution.rank_totals.items():
+                    expert_ids, sorted_counts = _sort_expert_counts(rank_counts)
+                    coverage = _top_n_expert_coverage(rank_counts, top_n_experts)
+                    fig, axis = plt.subplots(figsize=(16, 6))
+                    positions = np.arange(num_experts)
+                    axis.bar(
+                        positions,
+                        sorted_counts,
+                        color="#2F6F8F",
+                        edgecolor="#202020",
+                        linewidth=0.35,
+                    )
+                    axis.set_xticks(positions)
+                    axis.set_xticklabels(
+                        [str(expert_id) for expert_id in expert_ids],
+                        rotation=90,
+                        fontsize=max(4, min(8, 700 // num_experts)),
+                    )
+                    axis.set_xlabel("Expert ID (sorted by assignment count)")
+                    axis.set_ylabel("Token-expert assignments")
+                    axis.set_title(
+                        f"Rank {rank}: all traced token-to-expert assignments"
+                    )
+                    if coverage:
+                        coverage_text = "\n".join(
+                            f"Top-{top_n}: "
+                            f"{metrics['token_expert_assignments']:,} "
+                            f"({metrics['assignment_share_percent']:.2f}%)"
+                            for top_n, metrics in coverage.items()
+                        )
+                        axis.text(
+                            0.99,
+                            0.96,
+                            coverage_text,
+                            transform=axis.transAxes,
+                            horizontalalignment="right",
+                            verticalalignment="top",
+                            fontsize=9,
+                            bbox={
+                                "facecolor": "white",
+                                "edgecolor": "#777777",
+                                "alpha": 0.9,
+                            },
+                        )
+                        print(
+                            f"dataset={dataset}, batch_size={batch_size}, "
+                            f"layer={layer}, rank={rank}: "
+                            + ", ".join(
+                                f"top_{top_n}="
+                                f"{metrics['token_expert_assignments']} "
+                                f"({metrics['assignment_share_percent']:.2f}%)"
+                                for top_n, metrics in coverage.items()
+                            )
+                        )
+                    axis.yaxis.set_major_locator(MaxNLocator(integer=True))
+                    axis.grid(axis="y", alpha=0.2)
+                    fig.suptitle(
+                        f"{dataset}, batch size {batch_size}, layer {layer}",
+                        fontsize=14,
+                    )
+                    fig.tight_layout()
+                    rank_output = output_dir / (
+                        f"expert_counts_{dataset}_batch_{batch_size:04d}_"
+                        f"layer_{layer:04d}_rank_{rank:05d}.png"
+                    )
+                    fig.savefig(rank_output, dpi=200, bbox_inches="tight")
+                    plt.close(fig)
+                    outputs.append(rank_output)
+    _write_distribution_data(
+        work_dir, datasets, batch_sizes, distributions, top_n_experts
+    )
     return outputs
 
 
@@ -719,6 +852,7 @@ def collect(args: argparse.Namespace) -> None:
         batch_sizes=args.batch_sizes,
         requested_layers=args.layers,
         max_steps=args.max_steps,
+        top_n_experts=args.top_n_experts,
     )
     print(f"Saved {len(outputs)} plots under {args.output_dir / 'plots'}")
     print(f"Saved aggregate data to {args.output_dir / 'expert_distribution.json'}")
@@ -737,6 +871,7 @@ def plot(args: argparse.Namespace) -> None:
         batch_sizes=batch_sizes,
         requested_layers=args.layers,
         max_steps=args.max_steps,
+        top_n_experts=args.top_n_experts,
     )
     for output in outputs:
         print(f"Saved {output}")
@@ -753,7 +888,18 @@ def _add_plot_filters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-steps",
         type=int,
-        help="Limit every panel to its first N model-forward steps.",
+        help="Limit forward-series panels to their first N model-forward steps.",
+    )
+    parser.add_argument(
+        "--top-n-experts",
+        type=int,
+        nargs="+",
+        default=[],
+        metavar="N",
+        help=(
+            "Report how many token-expert assignments are covered by the N "
+            "most-loaded experts; accepts one or more N values."
+        ),
     )
 
 
