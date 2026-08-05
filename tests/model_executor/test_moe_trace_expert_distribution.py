@@ -13,6 +13,16 @@ from examples.basic.offline_inference.moe_trace_expert_distribution import (
     _top_n_expert_coverage,
     _validate_top_n_experts,
 )
+from examples.basic.offline_inference.moe_trace_replica_simulation import (
+    LatencyModel,
+    _mark_pareto_points,
+    _optimize_replicas,
+    _physical_expert_layout,
+    _route_step,
+    _route_to_physical_topk_ids,
+    _synthesize_logical_topk_ids,
+    _theoretical_latency_lower_bounds,
+)
 from vllm.model_executor.layers.fused_moe.moe_trace import (
     MoETraceCollector,
     MoETraceConfig,
@@ -123,11 +133,147 @@ def test_trace_aggregation_sums_ranks_per_step_and_steps_per_rank(tmp_path):
     np.testing.assert_array_equal(layer.totals, [4, 3, 2])
     np.testing.assert_array_equal(layer.rank_totals[0], [3, 3, 1])
     np.testing.assert_array_equal(layer.rank_totals[1], [1, 0, 1])
+    np.testing.assert_array_equal(layer.rank_step_counts[0], [[2, 1, 1], [1, 2, 0]])
+    np.testing.assert_array_equal(layer.rank_step_counts[1], [[1, 0, 1], [0, 0, 0]])
     np.testing.assert_allclose(layer.shares[0], [50.0, 100 / 6, 100 / 3])
     np.testing.assert_allclose(layer.shares[1], [100 / 3, 200 / 3, 0])
     np.testing.assert_array_equal(layer.batch_indices, [0, 1])
     np.testing.assert_allclose(layer.imbalance, [1.5, 2.0])
     np.testing.assert_array_equal(layer.scheduled_tokens, [3, 1])
+
+
+def test_replica_routing_preserves_assignments_and_remote_counts():
+    demand = np.asarray([[3, 4], [5, 2]], dtype=np.int64)
+
+    routing = _route_step(
+        demand,
+        [{0}, {1}],
+        LatencyModel(1.0, 1.0),
+        compute_weight=1.0,
+        communication_weight=1.0,
+        routing_chunks=4,
+    )
+
+    np.testing.assert_array_equal(routing.expert_rank_loads.sum(axis=1), [8, 6])
+    np.testing.assert_array_equal(routing.rank_loads, [8, 6])
+    np.testing.assert_array_equal(routing.outbound_remote, [4, 5])
+    np.testing.assert_array_equal(routing.inbound_remote, [5, 4])
+    np.testing.assert_array_equal(routing.source_expert_rank_loads.sum(axis=2), demand)
+    assert routing.remote_assignments == 9
+    assert routing.rank_loads.sum() == demand.sum()
+
+
+def test_replica_trace_counts_map_to_physical_expert_ids():
+    logical_ids = _synthesize_logical_topk_ids(
+        np.asarray([2, 2], dtype=np.int64), top_k=2
+    )
+    physical_layout, capacity = _physical_expert_layout([{0, 1}, {1}], ep_size=2)
+    physical_ids = _route_to_physical_topk_ids(
+        logical_ids,
+        np.asarray([[1, 1], [0, 2]], dtype=np.int64),
+        physical_layout,
+        source_rank=0,
+    )
+
+    assert capacity == 2
+    np.testing.assert_array_equal(physical_layout, [[0, 2], [-1, 3]])
+    np.testing.assert_array_equal(
+        np.bincount(physical_ids.reshape(-1), minlength=4), [1, 0, 1, 2]
+    )
+    assert all(len(set(row)) == 2 for row in physical_ids.tolist())
+
+
+def test_synthesized_topk_ids_preserve_nonuniform_expert_counts():
+    counts = np.asarray([3, 2, 2, 1], dtype=np.int64)
+
+    logical_ids = _synthesize_logical_topk_ids(counts, top_k=2)
+
+    np.testing.assert_array_equal(
+        np.bincount(logical_ids.reshape(-1), minlength=len(counts)), counts
+    )
+    assert logical_ids.shape == (4, 2)
+    assert all(len(set(row)) == 2 for row in logical_ids.tolist())
+
+
+def test_replica_policies_expose_locality_balance_tradeoff():
+    demand = np.asarray([[30, 10], [0, 10]], dtype=np.int64)
+    base_replicas = [{0}, {1}]
+    latency_model = LatencyModel(1.0, 1.0)
+
+    unchanged, no_placements = _optimize_replicas(
+        demand,
+        base_replicas,
+        0,
+        latency_model,
+        compute_weight=1.0,
+        communication_weight=1.0,
+        routing_chunks=10,
+        candidate_limit=0,
+    )
+    communication_replicas, communication_placements = _optimize_replicas(
+        demand,
+        base_replicas,
+        1,
+        latency_model,
+        compute_weight=0.0,
+        communication_weight=1.0,
+        routing_chunks=10,
+        candidate_limit=0,
+    )
+    balance_replicas, balance_placements = _optimize_replicas(
+        demand,
+        base_replicas,
+        1,
+        latency_model,
+        compute_weight=1.0,
+        communication_weight=0.0,
+        routing_chunks=10,
+        candidate_limit=0,
+    )
+
+    assert unchanged == base_replicas
+    assert no_placements == []
+    assert communication_replicas == [{0}, {0, 1}]
+    assert communication_placements == [(1, 0)]
+    assert balance_replicas == [{0, 1}, {1}]
+    assert balance_placements == [(0, 1)]
+
+
+def test_replica_latency_lower_bounds_are_computed_per_step():
+    demands = np.asarray([[[3, 4], [5, 2]], [[0, 1], [0, 0]]], dtype=np.int64)
+
+    compute_ms, communication_ms = _theoretical_latency_lower_bounds(
+        demands,
+        [{0}, {1}],
+        LatencyModel(1000.0, 1000.0),
+    )
+
+    assert compute_ms == 8.0
+    assert communication_ms == 12.0
+
+
+def test_replica_pareto_filter_removes_latency_dominated_points():
+    points = [
+        {
+            "estimated_compute_latency_ms": 10.0,
+            "estimated_communication_latency_ms": 10.0,
+            "used_extra_replicas": 0,
+        },
+        {
+            "estimated_compute_latency_ms": 8.0,
+            "estimated_communication_latency_ms": 9.0,
+            "used_extra_replicas": 2,
+        },
+        {
+            "estimated_compute_latency_ms": 9.0,
+            "estimated_communication_latency_ms": 7.0,
+            "used_extra_replicas": 1,
+        },
+    ]
+
+    _mark_pareto_points(points)
+
+    assert [point["pareto_optimal"] for point in points] == [False, True, True]
 
 
 def test_expert_counts_are_sorted_descending_with_stable_expert_ids():

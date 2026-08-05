@@ -529,7 +529,9 @@ def run_one_iter(
     )
     remote_assignments = sum(target_assignments) - target_assignments[rank]
     remote_unique_tokens = sum(target_unique_tokens) - target_unique_tokens[rank]
-    actual_local_share = target_unique_tokens[rank] / args.tokens
+    actual_local_share = (
+        target_unique_tokens[rank] / args.tokens if args.tokens else 0.0
+    )
 
     def prepare():
         return kernel.impl._prepare(
@@ -687,7 +689,9 @@ def run_local_bypass_iter(
     )
     remote_assignments = sum(target_assignments) - target_assignments[rank]
     remote_unique_tokens = sum(target_unique_tokens) - target_unique_tokens[rank]
-    actual_local_share = target_unique_tokens[rank] / args.tokens
+    actual_local_share = (
+        target_unique_tokens[rank] / args.tokens if args.tokens else 0.0
+    )
 
     def prepare():
         target_ranks = torch.div(

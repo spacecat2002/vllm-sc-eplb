@@ -48,6 +48,7 @@ class LayerDistribution:
     scheduled_tokens: np.ndarray
     totals: np.ndarray
     rank_totals: dict[int, np.ndarray]
+    rank_step_counts: dict[int, np.ndarray]
 
 
 @dataclass
@@ -401,6 +402,7 @@ def _aggregate_trace(experiment_dir: Path) -> TraceDistribution:
     request_batches = metadata.get("request_batches", {})
     counts: dict[tuple[int, int], np.ndarray] = {}
     rank_counts: dict[tuple[int, int], np.ndarray] = {}
+    rank_step_counts: dict[tuple[int, int, int], np.ndarray] = {}
     scheduled_tokens: dict[tuple[int, int], int] = {}
     batches: dict[tuple[int, int], set[int]] = {}
     paths = sorted((experiment_dir / "activations").glob("rank_*/step_*_layer_*.pt"))
@@ -430,6 +432,7 @@ def _aggregate_trace(experiment_dir: Path) -> TraceDistribution:
         rank_counts[rank_key] = (
             rank_counts.get(rank_key, np.zeros(num_experts, dtype=np.int64)) + value
         )
+        rank_step_counts[(rank, layer, step)] = value
         recorded_tokens = record["topk_ids"].shape[0] if "topk_ids" in record else 0
         scheduled_tokens[key] = scheduled_tokens.get(key, 0) + int(
             record.get("num_scheduled_tokens", recorded_tokens)
@@ -440,6 +443,19 @@ def _aggregate_trace(experiment_dir: Path) -> TraceDistribution:
             if f"{rank}:{request_id}" in request_batches
         }
         batches.setdefault(key, set()).update(record_batches)
+
+    traced_ranks = sorted({rank for rank, _ in rank_counts})
+    inferred_ep_size = traced_ranks[-1] + 1
+    ep_size = int(metadata.get("ep_size", inferred_ep_size))
+    if ep_size < inferred_ep_size:
+        raise ValueError(
+            f"Trace contains rank {traced_ranks[-1]}, but metadata ep_size is {ep_size}"
+        )
+    placement_strategy = str(metadata.get("expert_placement_strategy", "linear"))
+    if placement_strategy not in ("linear", "round_robin"):
+        raise ValueError(
+            f"Unsupported expert placement strategy: {placement_strategy!r}"
+        )
 
     layers = {}
     for layer in sorted({layer for layer, _ in counts}):
@@ -488,18 +504,18 @@ def _aggregate_trace(experiment_dir: Path) -> TraceDistribution:
                 for rank, count_layer in sorted(rank_counts)
                 if count_layer == layer
             },
-        )
-    traced_ranks = sorted(rank for rank, _ in rank_counts)
-    inferred_ep_size = traced_ranks[-1] + 1
-    ep_size = int(metadata.get("ep_size", inferred_ep_size))
-    if ep_size < inferred_ep_size:
-        raise ValueError(
-            f"Trace contains rank {traced_ranks[-1]}, but metadata ep_size is {ep_size}"
-        )
-    placement_strategy = str(metadata.get("expert_placement_strategy", "linear"))
-    if placement_strategy not in ("linear", "round_robin"):
-        raise ValueError(
-            f"Unsupported expert placement strategy: {placement_strategy!r}"
+            rank_step_counts={
+                rank: np.stack(
+                    [
+                        rank_step_counts.get(
+                            (rank, layer, int(step)),
+                            np.zeros(num_experts, dtype=np.int64),
+                        )
+                        for step in raw_steps
+                    ]
+                )
+                for rank in range(ep_size)
+            },
         )
     return TraceDistribution(num_experts, ep_size, placement_strategy, layers)
 

@@ -211,3 +211,129 @@ Per-rank entries additionally store the selected local expert IDs and their
 count and percentage within Top-N.
 This aggregate is useful for quantitative checks; the plots emphasize changes
 over scheduler forwards.
+
+## Simulate replicated experts from an existing trace
+
+`moe_trace_replica_simulation.py` replays the recorded per-forward,
+per-source-rank expert counts. It does not start vLLM or collect another trace.
+For example:
+
+```bash
+.venv/bin/python \
+  examples/basic/offline_inference/moe_trace_replica_simulation.py \
+  --work-dir /tmp/qwen3_expert_distribution \
+  --datasets math \
+  --batch-sizes 4 \
+  --layers 23 \
+  --extra-replicas 0 4 8 16 \
+  --communication-weights 0.1 0.3 1 3 10
+```
+
+The work directory must contain the `manifest.json`, `metadata.json`, and
+`activations/rank_*` files produced by the collection command. Omit datasets,
+batch sizes, or layers to use the values available in the manifest and trace.
+Results are written under `WORK_DIR/replica_simulation` by default:
+
+- `replica_simulation.json` contains all placements and detailed metrics.
+- `replica_simulation.csv` contains one row per policy and replica budget.
+- `replica_pareto_*.png` plots communication latency against compute latency.
+
+The simulator compares three greedy policies. `communication_first` places
+copies solely to reduce remote traffic, `balance_first` places copies solely to
+reduce the maximum rank load, and `joint` sweeps the supplied communication
+weights. A demand block can be divided into `--routing-chunks` pieces between
+available replicas. Increasing this value approximates finer-grained token
+routing at additional simulation cost. `--candidate-limit 0` evaluates every
+possible expert/rank copy and is useful for small experiments; the default
+uses locality and load shortlists.
+
+Replica placement is selected from the trace-wide aggregate demand to keep the
+greedy search tractable. After placement, every reported metric replays each
+recorded forward separately, preserving its source-rank demand and temporal
+load variation.
+
+`estimated_compute_latency_ms` sums the maximum assigned load across ranks for
+each recorded forward. `estimated_communication_latency_ms` sums the maximum
+inbound or outbound remote load and accounts for both dispatch and combine.
+`estimated_serial_latency_ms` assumes no compute/communication overlap, while
+`estimated_overlap_lower_bound_ms` takes the larger component in each forward
+and represents ideal overlap.
+`balanced_compute_lower_bound_ms` assumes every forward can be divided evenly
+among all ranks. `communication_lower_bound_ms` is a lower bound for the chosen
+replica layout: local-capable assignments communicate locally and unavoidable
+remote assignments are assumed to have ideally distributed inbound traffic.
+The Pareto flag and dashed frontier use the two estimated latency dimensions;
+replica count is reported as a resource cost but is not a Pareto objective.
+
+The default coefficients are normalized values of one microsecond per
+assignment. They are useful for comparing policies but are not measured GPU
+latencies. Supply calibrated coefficients to estimate hardware time:
+
+```bash
+.venv/bin/python \
+  examples/basic/offline_inference/moe_trace_replica_simulation.py \
+  --work-dir /tmp/qwen3_expert_distribution \
+  --compute-us-per-assignment 0.08 \
+  --communication-us-per-assignment 0.15
+```
+
+Count-only traces preserve the number of token-expert assignments but not the
+top-k expert tuple for each token. Consequently, the communication model cannot
+reconstruct token coalescing, message startup costs, topology, or overlap. Use
+the resulting frontier to select candidate policies, then validate those
+points with an end-to-end GPU benchmark.
+
+## Replay the trace with real GPU operators
+
+After generating `replica_simulation.json`, the distributed replay benchmark
+can measure the selected placements with real DeepEP-HT dispatch/combine and
+the vLLM Triton expert kernel. Launch one process per trace EP rank:
+
+```bash
+.venv/bin/python -m torch.distributed.run \
+  --standalone \
+  --nproc-per-node=4 \
+  --module benchmarks.kernels.benchmark_moe_trace_replay \
+  --work-dir /tmp/qwen3_expert_distribution \
+  --dataset math \
+  --batch-size 4 \
+  --layer 23 \
+  --policies baseline communication_first balance_first joint \
+  --extra-replicas 0 8 \
+  --communication-weights 0.3 1 3 \
+  --warmup 2 \
+  --iters 5
+```
+
+`WORLD_SIZE` must equal the trace EP size. The benchmark loads the chosen
+replica placements, gives every copy a physical expert slot on its target rank,
+and repeats every recorded forward. For each forward it measures dispatch,
+expert compute, and combine separately, then uses the maximum rank time for
+each stage. The reported replay time is the sum of those stage critical paths
+over all selected forwards. JSON, CSV, and a measured Pareto plot are written
+next to `replica_simulation.json` as `operator_timing_*` files.
+
+All points selected in one invocation use the same padded physical expert
+capacity per rank: the largest capacity required by any selected point. Unused
+slots receive no tokens. This keeps kernel metadata shapes identical across
+policies. To measure an unpadded native baseline, run a separate invocation
+with `--policies baseline`.
+
+The default `full_deepep` mode runs every token through the normal DeepEP path.
+`--execution-mode local_bypass` additionally sends tokens whose entire top-k is
+local through the local MoE kernel and sends the remaining tokens through
+DeepEP. Run the modes separately when evaluating whether explicit local bypass
+is worthwhile.
+
+The benchmark uses random BF16 activations and weights with the model's real
+MoE dimensions, because weight values do not change the kernel shape. Built-in
+dimensions are available for the Qwen3 presets listed in the benchmark. For a
+different model, pass `--hidden-size`, `--intermediate-size`, and `--top-k`.
+
+These are real operator timings, but still not end-to-end inference latency.
+Count-only traces do not contain each token's original top-k tuple. The replay
+therefore reconstructs unique top-k rows while exactly preserving every
+source-rank/expert/target-rank assignment count. This makes expert load exact,
+but the number of unique payloads sent to each destination is approximate. A
+full trace containing token-level top-k IDs is required for exact communication
+coalescing.
