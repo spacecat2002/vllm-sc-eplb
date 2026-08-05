@@ -328,7 +328,10 @@ is worthwhile.
 The benchmark uses random BF16 activations and weights with the model's real
 MoE dimensions, because weight values do not change the kernel shape. Built-in
 dimensions are available for the Qwen3 presets listed in the benchmark. For a
-different model, pass `--hidden-size`, `--intermediate-size`, and `--top-k`.
+local model directory, the benchmark reads `config.json` and recognizes the
+usual `hidden_size`, `moe_intermediate_size`, and `num_experts_per_tok` fields,
+including fields nested under `text_config`. If a custom configuration uses
+different names, pass `--hidden-size`, `--intermediate-size`, and `--top-k`.
 
 These are real operator timings, but still not end-to-end inference latency.
 Count-only traces do not contain each token's original top-k tuple. The replay

@@ -229,15 +229,18 @@ def _resolve_model_shape(
 ) -> dict[str, Any]:
     model = args.model or simulation.get("model")
     preset = MODEL_CONFIGS.get(model, {})
+    local_config = _load_local_model_shape(model)
 
     def resolve(name: str) -> int:
         value = getattr(args, name)
+        if value is None:
+            value = local_config.get(name)
         if value is None:
             value = preset.get(name)
         if value is None:
             option = name.replace("_", "-")
             raise ValueError(
-                f"No built-in shape is available for model {model!r}; pass --{option}"
+                f"Could not resolve {name} for model {model!r}; pass --{option}"
             )
         if int(value) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
@@ -248,6 +251,59 @@ def _resolve_model_shape(
         "hidden_size": resolve("hidden_size"),
         "intermediate_size": resolve("intermediate_size"),
         "top_k": resolve("top_k"),
+        "config_num_experts": local_config.get("num_experts"),
+    }
+
+
+def _load_local_model_shape(model: str | None) -> dict[str, int]:
+    if model is None:
+        return {}
+    model_path = Path(model).expanduser()
+    config_path = model_path / "config.json" if model_path.is_dir() else model_path
+    if not config_path.is_file() or config_path.name != "config.json":
+        return {}
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    sections = [
+        section
+        for section in (
+            config.get("text_config"),
+            config.get("llm_config"),
+            config,
+        )
+        if isinstance(section, dict)
+    ]
+
+    def first(names: tuple[str, ...]) -> int | None:
+        for section in sections:
+            for name in names:
+                value = section.get(name)
+                if value is not None:
+                    return int(value)
+        return None
+
+    aliases = {
+        "hidden_size": ("hidden_size", "d_model", "n_embd"),
+        "intermediate_size": (
+            "moe_intermediate_size",
+            "expert_intermediate_size",
+            "intermediate_size",
+        ),
+        "top_k": (
+            "num_experts_per_tok",
+            "num_experts_per_token",
+            "moe_top_k",
+            "top_k",
+        ),
+        "num_experts": (
+            "num_experts",
+            "n_routed_experts",
+            "num_local_experts",
+        ),
+    }
+    return {
+        name: value
+        for name, field_aliases in aliases.items()
+        if (value := first(field_aliases)) is not None
     }
 
 
@@ -611,6 +667,14 @@ def run_worker(args: argparse.Namespace) -> None:
         raise ValueError(f"Layer {args.layer} is missing from the trace")
 
     shape = _resolve_model_shape(args, simulation)
+    if (
+        shape["config_num_experts"] is not None
+        and int(shape["config_num_experts"]) != trace.num_experts
+    ):
+        raise ValueError(
+            f"Model config has {shape['config_num_experts']} experts, but the "
+            f"trace has {trace.num_experts}"
+        )
     demands = _demand_tensor(trace, args.layer)
     if args.max_steps is not None:
         demands = demands[: args.max_steps]
