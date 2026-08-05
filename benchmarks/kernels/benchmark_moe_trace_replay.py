@@ -724,18 +724,14 @@ def run_worker(args: argparse.Namespace) -> None:
         rank,
     )
     physical_num_experts = capacity_per_rank * world_size
-    kernel_args = argparse.Namespace(
-        model=shape["model"],
-        tokens=max_tokens,
-        hidden_size=shape["hidden_size"],
-        intermediate_size=shape["intermediate_size"],
-        num_experts=physical_num_experts,
-        top_k=shape["top_k"],
-        seed=args.seed,
-        stage_barrier=args.stage_barrier,
-        detail_profile=False,
-        execution_mode=args.execution_mode,
-    )
+    kernel_args = copy(args)
+    kernel_args.model = shape["model"]
+    kernel_args.tokens = max_tokens
+    kernel_args.hidden_size = shape["hidden_size"]
+    kernel_args.intermediate_size = shape["intermediate_size"]
+    kernel_args.num_experts = physical_num_experts
+    kernel_args.top_k = shape["top_k"]
+    kernel_args.detail_profile = False
 
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
