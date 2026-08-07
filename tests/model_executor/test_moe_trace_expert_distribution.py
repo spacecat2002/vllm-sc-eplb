@@ -17,9 +17,11 @@ from examples.basic.offline_inference.moe_trace_replica_simulation import (
     LatencyModel,
     _mark_pareto_points,
     _optimize_replicas,
+    _optimize_token_replicas,
     _physical_expert_layout,
     _route_step,
     _route_to_physical_topk_ids,
+    _route_token_step,
     _synthesize_logical_topk_ids,
     _theoretical_latency_lower_bounds,
 )
@@ -161,6 +163,101 @@ def test_replica_routing_preserves_assignments_and_remote_counts():
     np.testing.assert_array_equal(routing.source_expert_rank_loads.sum(axis=2), demand)
     assert routing.remote_assignments == 9
     assert routing.rank_loads.sum() == demand.sum()
+
+
+def test_token_routing_counts_local_tokens_and_remote_transfers():
+    routing = _route_token_step(
+        [
+            np.asarray([[0, 1], [0, 1]], dtype=np.int64),
+            np.empty((0, 2), dtype=np.int64),
+        ],
+        [{0, 1}, {1}],
+        LatencyModel(1.0, 1.0),
+        compute_weight=0.0,
+        communication_weight=1.0,
+    )
+
+    assert routing.local_tokens == 0
+    assert routing.remote_tokens == 2
+    assert routing.remote_token_transfers == 2
+    assert routing.communication_latency_ms == 0.004
+    np.testing.assert_array_equal(routing.rank_assignment_loads, [0, 4])
+    np.testing.assert_array_equal(routing.rank_token_loads, [0, 2])
+    np.testing.assert_array_equal(routing.outbound_remote_tokens, [2, 0])
+    np.testing.assert_array_equal(routing.inbound_remote_tokens, [0, 2])
+
+
+def test_token_routing_coalesces_remote_experts_on_fewer_ranks():
+    routing = _route_token_step(
+        [
+            np.asarray([[0, 1]], dtype=np.int64),
+            np.empty((0, 2), dtype=np.int64),
+            np.empty((0, 2), dtype=np.int64),
+            np.empty((0, 2), dtype=np.int64),
+        ],
+        [{1, 2}, {2, 3}],
+        LatencyModel(1.0, 1.0),
+        compute_weight=0.0,
+        communication_weight=1.0,
+    )
+
+    np.testing.assert_array_equal(routing.target_ranks_by_source[0], [[2, 2]])
+    assert routing.remote_tokens == 1
+    assert routing.remote_token_transfers == 1
+    assert routing.communication_latency_ms == 0.002
+
+
+def test_token_routing_balances_expert_input_tokens_per_rank():
+    routing = _route_token_step(
+        [
+            np.asarray([[0, 1], [0, 1]], dtype=np.int64),
+            np.empty((0, 2), dtype=np.int64),
+        ],
+        [{0}, {0, 1}],
+        LatencyModel(1.0, 1.0),
+        compute_weight=1.0,
+        communication_weight=0.0,
+    )
+
+    np.testing.assert_array_equal(routing.rank_assignment_loads, [2, 2])
+    np.testing.assert_array_equal(routing.rank_token_loads, [2, 2])
+    assert routing.expert_rank_loads.sum() == 4
+
+
+def test_token_routing_keeps_same_rank_set_with_different_assignment_splits():
+    routing = _route_token_step(
+        [
+            np.asarray([[0, 1, 2], [0, 3, 4]], dtype=np.int64),
+            np.empty((0, 3), dtype=np.int64),
+        ],
+        [{0}, {0}, {0}, {0, 1}, {0, 1}],
+        LatencyModel(1.0, 1.0),
+        compute_weight=1.0,
+        communication_weight=0.0,
+    )
+
+    np.testing.assert_array_equal(routing.rank_assignment_loads, [4, 2])
+    np.testing.assert_array_equal(routing.target_ranks_by_source[0][1], [0, 1, 1])
+
+
+def test_token_replica_budget_stops_when_objective_cannot_improve():
+    replicas, placements = _optimize_token_replicas(
+        [
+            [
+                np.asarray([[0]], dtype=np.int64),
+                np.asarray([[1]], dtype=np.int64),
+            ]
+        ],
+        [{0}, {1}],
+        2,
+        LatencyModel(1.0, 1.0),
+        compute_weight=0.0,
+        communication_weight=1.0,
+        candidate_limit=0,
+    )
+
+    assert replicas == [{0}, {1}]
+    assert placements == []
 
 
 def test_replica_trace_counts_map_to_physical_expert_ids():
@@ -397,3 +494,35 @@ def test_distribution_mode_saves_exact_counts_without_training_tensors(tmp_path)
     assert "topk_ids" not in record
     assert "router_logits" not in record
     assert "activations" not in record
+
+
+def test_distribution_mode_can_capture_token_topk_ids(tmp_path):
+    collector = MoETraceCollector(
+        MoETraceConfig(
+            output_dir=tmp_path,
+            max_steps=1,
+            capture_next_gate_base_logits=False,
+            mode="expert_distribution",
+            capture_topk_ids=True,
+        ),
+        {4: "model.layers.4.mlp"},
+        {},
+    )
+    collector.begin_forward(
+        num_scheduled_tokens=[2],
+        num_computed_tokens=[0],
+        prefill_lengths=[2],
+        request_ids=["request-0"],
+    )
+    hidden_states = torch.zeros((2, 1))
+    router_logits = torch.zeros((2, 3))
+    topk_ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int64)
+    topk_weights = torch.ones((2, 2))
+
+    collector.capture(4, hidden_states, router_logits, topk_weights, topk_ids)
+
+    record = torch.load(
+        tmp_path / "rank_00000" / "step_000000_layer_0004.pt",
+        weights_only=True,
+    )
+    assert torch.equal(record["topk_ids"], topk_ids.to(torch.int32))

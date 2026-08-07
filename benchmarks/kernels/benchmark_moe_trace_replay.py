@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Replay traced MoE distributions through real DeepEP-HT and expert kernels.
+"""Replay traced MoE distributions through local bypass and expert kernels.
 
 Run this module with one process per expert-parallel rank::
 
@@ -13,8 +13,8 @@ Run this module with one process per expert-parallel rank::
 
 The benchmark uses synthetic activations and weights with the traced token and
 expert shapes. Count-only traces require reconstructing token top-k rows, so
-expert assignment counts are exact while token destination coalescing is an
-approximation.
+expert assignment counts are exact while local-token and remote-transfer
+coalescing are an approximation.
 """
 
 from __future__ import annotations
@@ -40,7 +40,6 @@ from benchmarks.kernels.benchmark_deepep_ht_distribution import (
     make_kernels,
     make_vllm_config,
     run_local_bypass_iter,
-    run_one_iter,
 )
 from examples.basic.offline_inference.moe_trace_expert_distribution import (
     _aggregate_trace,
@@ -51,10 +50,11 @@ from examples.basic.offline_inference.moe_trace_replica_simulation import (
     _base_replicas,
     _copy_replicas,
     _demand_tensor,
+    _evaluate_token_trace,
+    _load_token_trace,
     _physical_expert_layout,
-    _route_step,
-    _route_to_physical_topk_ids,
-    _synthesize_logical_topk_ids,
+    _route_targets_to_physical_topk_ids,
+    _route_token_step,
 )
 from vllm.config import set_current_vllm_config
 from vllm.distributed import (
@@ -119,14 +119,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--execution-mode",
-        choices=("full_deepep", "local_bypass"),
-        default="full_deepep",
-        help=(
-            "Use the production DeepEP path, or bypass DeepEP for tokens whose "
-            "entire synthesized top-k is local."
-        ),
+        choices=("local_bypass",),
+        default="local_bypass",
+        help="Trace replay always uses the local-bypass execution path.",
     )
     parser.add_argument("--output-json", type=Path)
+    parser.add_argument(
+        "--plot-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Read an existing operator timing JSON and redraw the best measured "
+            "expert load without launching distributed GPU replay."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -174,7 +180,8 @@ def _select_points(
         if (
             policy != "baseline"
             and requested_budgets is not None
-            and int(point["used_extra_replicas"]) not in requested_budgets
+            and int(point.get("requested_extra_replicas", point["used_extra_replicas"]))
+            not in requested_budgets
         ):
             continue
         if (
@@ -190,7 +197,11 @@ def _select_points(
 
 
 def _point_label(point: dict[str, Any]) -> str:
-    label = f"{point['policy']}:B={point['used_extra_replicas']}"
+    requested = int(point.get("requested_extra_replicas", point["used_extra_replicas"]))
+    used = int(point["used_extra_replicas"])
+    label = f"{point['policy']}:B={requested}"
+    if used != requested:
+        label += f":used={used}"
     if point["communication_weight"] is not None:
         label += f":w={point['communication_weight']:g}"
     return label
@@ -221,6 +232,17 @@ def _routing_weights(point: dict[str, Any]) -> tuple[float, float]:
     if point["policy"] == "joint":
         return 1.0, float(point["communication_weight"])
     return 1.0, 1.0
+
+
+def _latency_config_value(
+    config: dict[str, Any],
+    token_name: str,
+    legacy_name: str,
+) -> float:
+    value = config.get(token_name, config.get(legacy_name))
+    if value is None:
+        raise ValueError(f"Simulation latency model is missing {token_name!r}")
+    return float(value)
 
 
 def _resolve_model_shape(
@@ -309,14 +331,12 @@ def _load_local_model_shape(model: str | None) -> dict[str, int]:
 
 def _make_local_replay_plans(
     points: list[dict[str, Any]],
-    demands: np.ndarray,
-    logical_topk_ids: list[np.ndarray],
+    token_steps: list[list[np.ndarray]],
     base_replicas: list[set[int]],
     latency_model: LatencyModel,
-    routing_chunks: int,
     rank: int,
 ) -> tuple[list[dict[str, Any]], int]:
-    ep_size = demands.shape[1]
+    ep_size = len(token_steps[0])
     point_replicas = [_point_replicas(base_replicas, point) for point in points]
     capacities = [
         _physical_expert_layout(replicas, ep_size)[1] for replicas in point_replicas
@@ -329,21 +349,31 @@ def _make_local_replay_plans(
         )
         compute_weight, communication_weight = _routing_weights(point)
         physical_topk_ids = []
-        for demand, logical_ids in zip(demands, logical_topk_ids):
-            routing = _route_step(
-                demand,
+        expert_rank_loads = np.zeros((len(base_replicas), ep_size), dtype=np.int64)
+        rank_assignment_loads = np.zeros(ep_size, dtype=np.int64)
+        rank_token_loads = np.zeros(ep_size, dtype=np.int64)
+        local_tokens = 0
+        remote_tokens = 0
+        remote_token_transfers = 0
+        for step in token_steps:
+            routing = _route_token_step(
+                step,
                 replicas,
                 latency_model,
                 compute_weight=compute_weight,
                 communication_weight=communication_weight,
-                routing_chunks=routing_chunks,
             )
+            expert_rank_loads += routing.expert_rank_loads
+            rank_assignment_loads += routing.rank_assignment_loads
+            rank_token_loads += routing.rank_token_loads
+            local_tokens += routing.local_tokens
+            remote_tokens += routing.remote_tokens
+            remote_token_transfers += routing.remote_token_transfers
             physical_topk_ids.append(
-                _route_to_physical_topk_ids(
-                    logical_ids,
-                    routing.source_expert_rank_loads[rank],
+                _route_targets_to_physical_topk_ids(
+                    step[rank],
+                    routing.target_ranks_by_source[rank],
                     physical_layout,
-                    rank,
                 )
             )
         plans.append(
@@ -351,58 +381,15 @@ def _make_local_replay_plans(
                 "point": point,
                 "replicas": replicas,
                 "physical_topk_ids": physical_topk_ids,
+                "expert_rank_loads": expert_rank_loads,
+                "rank_assignment_loads": rank_assignment_loads,
+                "rank_token_loads": rank_token_loads,
+                "local_tokens": local_tokens,
+                "remote_tokens": remote_tokens,
+                "remote_token_transfers": remote_token_transfers,
             }
         )
     return plans, capacity_per_rank
-
-
-def _load_captured_topk_ids(
-    experiment_dir: Path,
-    layer_id: int,
-    raw_steps: np.ndarray,
-    demands: np.ndarray,
-    top_k: int,
-    replay_rank: int,
-) -> list[np.ndarray] | None:
-    local_ids = []
-    for source_rank in range(demands.shape[1]):
-        source_ids = []
-        for step_index, raw_step in enumerate(raw_steps):
-            path = (
-                experiment_dir
-                / "activations"
-                / f"rank_{source_rank:05d}"
-                / f"step_{int(raw_step):06d}_layer_{layer_id:04d}.pt"
-            )
-            expected_counts = demands[step_index, source_rank]
-            if not path.exists():
-                if int(expected_counts.sum()):
-                    raise ValueError(f"Missing trace record {path}")
-                ids = np.empty((0, top_k), dtype=np.int64)
-            else:
-                record = torch.load(path, map_location="cpu", weights_only=True)
-                if "topk_ids" not in record:
-                    return None
-                ids = record["topk_ids"].to(torch.int64).numpy()
-                if ids.ndim != 2 or ids.shape[1] != top_k:
-                    raise ValueError(
-                        f"Captured top-k shape {ids.shape} in {path} does not match "
-                        f"top_k={top_k}"
-                    )
-                if np.any((ids < 0) | (ids >= demands.shape[2])):
-                    raise ValueError(f"Captured top-k IDs in {path} are out of range")
-                actual_counts = np.bincount(
-                    ids.reshape(-1), minlength=demands.shape[2]
-                ).astype(np.int64)
-                if not np.array_equal(actual_counts, expected_counts):
-                    raise ValueError(
-                        f"Captured top-k IDs in {path} do not match aggregated counts"
-                    )
-            if source_rank == replay_rank:
-                source_ids.append(ids)
-        if source_rank == replay_rank:
-            local_ids = source_ids
-    return local_ids
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -454,6 +441,15 @@ def _summarize_rows(
                 ),
                 "remote_unique_tokens": sum(
                     int(row["remote_unique_tokens"]) for row in rank_rows
+                ),
+                "local_path_tokens": sum(
+                    int(row.get("local_path_tokens", 0)) for row in rank_rows
+                ),
+                "deepep_source_tokens": sum(
+                    int(row.get("deepep_source_tokens", 0)) for row in rank_rows
+                ),
+                "active_destinations": sum(
+                    int(row.get("active_destinations", 0)) for row in rank_rows
                 ),
                 "received_tokens_min": min(received),
                 "received_tokens_max": max(received),
@@ -525,6 +521,27 @@ def _summarize_rows(
             for row in forward_rows
             if row["replay_iteration"] == 0
         ),
+        "local_path_tokens": int(forward_rows[0]["local_path_tokens"])
+        if num_steps == 1
+        else sum(
+            int(row["local_path_tokens"])
+            for row in forward_rows
+            if row["replay_iteration"] == 0
+        ),
+        "deepep_source_tokens": int(forward_rows[0]["deepep_source_tokens"])
+        if num_steps == 1
+        else sum(
+            int(row["deepep_source_tokens"])
+            for row in forward_rows
+            if row["replay_iteration"] == 0
+        ),
+        "active_destinations": int(forward_rows[0]["active_destinations"])
+        if num_steps == 1
+        else sum(
+            int(row["active_destinations"])
+            for row in forward_rows
+            if row["replay_iteration"] == 0
+        ),
     }
     return summary, forward_rows
 
@@ -542,6 +559,282 @@ def _mark_measured_pareto(results: list[dict[str, Any]]) -> None:
             )
             for other in results
         )
+
+
+def _best_measured_result(results: list[dict[str, Any]]) -> dict[str, Any]:
+    if not results:
+        raise ValueError("Operator timing JSON contains no measured results")
+    return min(
+        results,
+        key=lambda result: (
+            float(result["timing"]["serial_ms"]),
+            float(result["timing"]["communication_ms"]),
+            float(result["timing"]["compute_ms"]),
+            int(result["used_extra_replicas"]),
+            str(result["label"]),
+        ),
+    )
+
+
+def _assignment_profile(
+    expert_rank_loads: np.ndarray,
+    replicas: list[set[int]],
+    rank_unique_token_loads: np.ndarray,
+    *,
+    local_tokens: int | None = None,
+    remote_tokens: int | None = None,
+    remote_token_transfers: int | None = None,
+) -> dict[str, Any]:
+    loads = np.asarray(expert_rank_loads, dtype=np.int64)
+    if loads.ndim != 2 or loads.shape[0] != len(replicas):
+        raise ValueError(
+            "expert_rank_loads must have shape [logical_expert, target_rank]"
+        )
+    if np.any(loads < 0):
+        raise ValueError("expert_rank_loads must be non-negative")
+    token_loads = np.asarray(rank_unique_token_loads, dtype=np.int64)
+    if token_loads.ndim != 1 or token_loads.shape[0] != loads.shape[1]:
+        raise ValueError("rank_unique_token_loads must match the target-rank dimension")
+    if np.any(token_loads < 0):
+        raise ValueError("rank_unique_token_loads must be non-negative")
+    rank_assignment_loads = loads.sum(axis=0)
+    profile = {
+        "load_unit": "token_expert_assignments",
+        "expert_rank_assignment_loads": loads.tolist(),
+        "expert_assignment_loads": loads.sum(axis=1).tolist(),
+        "rank_assignment_loads": rank_assignment_loads.tolist(),
+        "rank_assignment_load_unit": "expert_input_tokens_per_target_rank",
+        "rank_unique_token_loads": token_loads.tolist(),
+        "rank_token_loads": token_loads.tolist(),
+        "rank_token_load_unit": "unique_tokens_per_target_rank",
+        "replica_ranks_by_expert": [sorted(ranks) for ranks in replicas],
+    }
+    if local_tokens is not None:
+        profile["local_tokens"] = int(local_tokens)
+    if remote_tokens is not None:
+        profile["remote_tokens"] = int(remote_tokens)
+    if remote_token_transfers is not None:
+        profile["remote_token_transfers"] = int(remote_token_transfers)
+    if remote_tokens is not None and remote_token_transfers is not None:
+        profile["communication_units"] = int(remote_token_transfers)
+    return profile
+
+
+def _best_load_paths(output_json: Path) -> tuple[Path, Path, Path]:
+    prefix = output_json.with_name(f"{output_json.stem}_best_expert_load")
+    return (
+        Path(f"{prefix}.json"),
+        Path(f"{prefix}.csv"),
+        Path(f"{prefix}.png"),
+    )
+
+
+def _plot_best_load(
+    result: dict[str, Any],
+    profile: dict[str, Any],
+    output: Path,
+    title: str,
+) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    loads = np.asarray(profile["expert_rank_assignment_loads"], dtype=np.int64)
+    totals = loads.sum(axis=1)
+    rank_assignment_loads = np.asarray(profile["rank_assignment_loads"], dtype=np.int64)
+    rank_unique_token_loads = np.asarray(
+        profile.get("rank_unique_token_loads", profile.get("rank_token_loads", [])),
+        dtype=np.int64,
+    )
+    expert_ids = np.arange(len(totals))
+    order = np.lexsort((expert_ids, -totals))
+    sorted_loads = loads[order]
+    positions = np.arange(len(order))
+    extra_experts = {
+        int(placement["expert_id"]) for placement in result["replica_placements"]
+    }
+
+    width = min(24.0, max(12.0, len(order) * 0.14))
+    fig, (expert_axis, rank_axis) = plt.subplots(
+        2,
+        1,
+        figsize=(width, 8.5),
+        gridspec_kw={"height_ratios": [4, 1], "hspace": 0.38},
+    )
+    colors = plt.get_cmap("tab20", loads.shape[1])
+    bottom = np.zeros(len(order), dtype=np.int64)
+    for rank in range(loads.shape[1]):
+        expert_axis.bar(
+            positions,
+            sorted_loads[:, rank],
+            width=0.86,
+            bottom=bottom,
+            color=colors(rank),
+            label=f"rank {rank}",
+            linewidth=0,
+        )
+        bottom += sorted_loads[:, rank]
+
+    extra_positions = [
+        index for index, expert_id in enumerate(order) if expert_id in extra_experts
+    ]
+    if extra_positions:
+        marker_height = max(int(totals.max(initial=0)), 1) * 1.025
+        expert_axis.scatter(
+            extra_positions,
+            [marker_height] * len(extra_positions),
+            color="#202020",
+            marker="*",
+            s=24,
+            zorder=3,
+        )
+        expert_axis.set_ylim(top=marker_height * 1.06)
+
+    tick_count = min(len(order), 32)
+    tick_indices = np.unique(np.linspace(0, len(order) - 1, tick_count, dtype=np.int64))
+    expert_axis.set_xticks(tick_indices)
+    expert_axis.set_xticklabels(
+        [f"E{int(order[index])}" for index in tick_indices],
+        rotation=60,
+        ha="right",
+    )
+    expert_axis.set_ylabel("Token-expert assignments")
+    expert_axis.set_xlabel("Logical experts sorted by total load")
+    expert_axis.set_title(
+        f"{title}\nBest: {result['label']}, "
+        f"serial={float(result['timing']['serial_ms']):.3f} ms"
+    )
+    expert_axis.grid(axis="y", alpha=0.2)
+    handles, labels = expert_axis.get_legend_handles_labels()
+    if extra_positions:
+        handles.append(
+            Line2D(
+                [],
+                [],
+                color="#202020",
+                marker="*",
+                linestyle="None",
+                label="expert with extra replica",
+            )
+        )
+        labels.append("expert with extra replica")
+    expert_axis.legend(
+        handles,
+        labels,
+        ncol=min(8, loads.shape[1] + int(bool(extra_positions))),
+        fontsize=8,
+    )
+
+    ranks = np.arange(len(rank_assignment_loads))
+    bar_width = 0.38
+    rank_axis.bar(
+        ranks - bar_width / 2,
+        rank_assignment_loads,
+        width=bar_width,
+        color=[colors(rank) for rank in ranks],
+        label="expert input tokens (compute load)",
+    )
+    rank_axis.bar(
+        ranks + bar_width / 2,
+        rank_unique_token_loads,
+        width=bar_width,
+        color="none",
+        edgecolor=[colors(rank) for rank in ranks],
+        hatch="//",
+        linewidth=1.0,
+        label="unique target-rank tokens",
+    )
+    mean_rank_load = (
+        float(rank_assignment_loads.mean()) if len(rank_assignment_loads) else 0.0
+    )
+    rank_axis.axhline(
+        mean_rank_load,
+        color="#202020",
+        linewidth=1.0,
+        linestyle="--",
+        label=f"ideal compute mean {mean_rank_load:.1f}",
+    )
+    rank_axis.set_xticks(ranks)
+    rank_axis.set_xticklabels([f"rank {rank}" for rank in ranks])
+    rank_axis.set_ylabel("Token count")
+    rank_axis.set_title("Aggregate target-rank load")
+    rank_axis.grid(axis="y", alpha=0.2)
+    rank_axis.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _write_best_load_outputs(
+    result: dict[str, Any],
+    profile: dict[str, Any],
+    output_json: Path,
+    title: str,
+) -> tuple[Path, Path, Path]:
+    load_json, load_csv, load_plot = _best_load_paths(output_json)
+    loads = np.asarray(profile["expert_rank_assignment_loads"], dtype=np.int64)
+    totals = loads.sum(axis=1)
+    order = np.lexsort((np.arange(len(totals)), -totals))
+    extra_by_expert: dict[int, list[int]] = defaultdict(list)
+    for placement in result["replica_placements"]:
+        extra_by_expert[int(placement["expert_id"])].append(int(placement["rank"]))
+
+    load_payload = {
+        "selection_metric": "minimum_measured_serial_ms",
+        "metric_definitions": {
+            "rank_assignment_loads": (
+                "token-expert assignments executed by each target rank"
+            ),
+            "rank_unique_token_loads": (
+                "unique source tokens routed to each target rank"
+            ),
+        },
+        "best_configuration": {
+            "label": result["label"],
+            "policy": result["policy"],
+            "communication_weight": result["communication_weight"],
+            "requested_extra_replicas": result.get(
+                "requested_extra_replicas", result["used_extra_replicas"]
+            ),
+            "used_extra_replicas": result["used_extra_replicas"],
+            "replica_placements": result["replica_placements"],
+            "timing": result["timing"],
+        },
+        "expert_order_descending_load": order.tolist(),
+        "assignment_profile": profile,
+    }
+    load_json.write_text(json.dumps(load_payload, indent=2), encoding="utf-8")
+
+    fieldnames = [
+        "load_order",
+        "expert_id",
+        "total_assignments",
+        *(f"rank_{rank}_assignments" for rank in range(loads.shape[1])),
+        "replica_ranks",
+        "extra_replica_ranks",
+    ]
+    with load_csv.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for load_order, expert_id in enumerate(order, start=1):
+            writer.writerow(
+                {
+                    "load_order": load_order,
+                    "expert_id": int(expert_id),
+                    "total_assignments": int(totals[expert_id]),
+                    **{
+                        f"rank_{rank}_assignments": int(loads[expert_id, rank])
+                        for rank in range(loads.shape[1])
+                    },
+                    "replica_ranks": json.dumps(
+                        profile["replica_ranks_by_expert"][expert_id]
+                    ),
+                    "extra_replica_ranks": json.dumps(
+                        sorted(extra_by_expert[int(expert_id)])
+                    ),
+                }
+            )
+    _plot_best_load(result, profile, load_plot, title)
+    return load_json, load_csv, load_plot
 
 
 def _plot_results(results: list[dict[str, Any]], output: Path, title: str) -> None:
@@ -608,14 +901,29 @@ def _plot_results(results: list[dict[str, Any]], output: Path, title: str) -> No
 def _write_csv(results: list[dict[str, Any]], output: Path) -> None:
     rows = []
     for result in results:
+        profile = result.get("assignment_profile", {})
         rows.append(
             {
                 "label": result["label"],
                 "policy": result["policy"],
                 "communication_weight": result["communication_weight"],
+                "requested_extra_replicas": result.get(
+                    "requested_extra_replicas", result["used_extra_replicas"]
+                ),
                 "used_extra_replicas": result["used_extra_replicas"],
                 "measured_pareto_optimal": result["measured_pareto_optimal"],
                 **result["timing"],
+                "local_tokens": profile.get("local_tokens"),
+                "remote_tokens": profile.get("remote_tokens"),
+                "remote_token_transfers": profile.get("remote_token_transfers"),
+                "rank_assignment_loads": json.dumps(
+                    profile.get("rank_assignment_loads", [])
+                ),
+                "rank_unique_token_loads": json.dumps(
+                    profile.get(
+                        "rank_unique_token_loads", profile.get("rank_token_loads", [])
+                    )
+                ),
                 "replica_placements": json.dumps(result["replica_placements"]),
             }
         )
@@ -635,6 +943,102 @@ def _default_output_path(args: argparse.Namespace) -> Path:
             f"layer_{args.layer:04d}_{args.execution_mode}.json"
         )
     )
+
+
+def _plot_existing_best_load(args: argparse.Namespace) -> None:
+    work_dir = args.work_dir.expanduser().resolve()
+    output_json = (
+        (args.output_json or _default_output_path(args)).expanduser().resolve()
+    )
+    measured = json.loads(output_json.read_text(encoding="utf-8"))
+    trace_metadata = measured.get("trace", {})
+    expected_trace = {
+        "dataset": args.dataset,
+        "batch_size_per_rank": args.batch_size,
+        "layer_id": args.layer,
+    }
+    mismatches = [
+        f"{key}={trace_metadata.get(key)!r}, expected {value!r}"
+        for key, value in expected_trace.items()
+        if trace_metadata.get(key) != value
+    ]
+    if mismatches:
+        raise ValueError(
+            f"Measured result {output_json} does not match the selected trace: "
+            + "; ".join(mismatches)
+        )
+
+    simulation_path = (
+        (
+            args.simulation_json
+            or work_dir / "replica_simulation/replica_simulation.json"
+        )
+        .expanduser()
+        .resolve()
+    )
+    simulation = json.loads(simulation_path.read_text(encoding="utf-8"))
+    experiment = _find_experiment(simulation, args.dataset, args.batch_size, args.layer)
+    experiment_dir = _experiment_dir(work_dir, args.dataset, args.batch_size)
+    trace = _aggregate_trace(experiment_dir)
+    if args.layer not in trace.layers:
+        raise ValueError(f"Layer {args.layer} is missing from the trace")
+    if int(experiment["num_experts"]) != trace.num_experts:
+        raise ValueError("Simulation and trace disagree on the logical expert count")
+
+    requested_top_k = args.top_k
+    if requested_top_k is None and experiment.get("top_k") is not None:
+        requested_top_k = int(experiment["top_k"])
+    token_steps, _, _ = _load_token_trace(
+        experiment_dir,
+        trace,
+        args.layer,
+        requested_top_k,
+    )
+    measured_steps = int(trace_metadata.get("num_steps", len(token_steps)))
+    if not 0 < measured_steps <= len(token_steps):
+        raise ValueError(
+            f"Measured num_steps={measured_steps} is outside the trace length "
+            f"{len(token_steps)}"
+        )
+    token_steps = token_steps[:measured_steps]
+    best = _best_measured_result(measured["results"])
+    replicas = _point_replicas(_base_replicas(trace), best)
+    latency_config = simulation["latency_model"]
+    compute_weight, communication_weight = _routing_weights(best)
+    routing = _evaluate_token_trace(
+        token_steps,
+        replicas,
+        LatencyModel(
+            compute_us_per_token=_latency_config_value(
+                latency_config,
+                "compute_us_per_token",
+                "compute_us_per_assignment",
+            ),
+            communication_us_per_token=_latency_config_value(
+                latency_config,
+                "communication_us_per_token",
+                "communication_us_per_assignment",
+            ),
+        ),
+        compute_weight=compute_weight,
+        communication_weight=communication_weight,
+    )
+    profile = _assignment_profile(
+        routing.expert_rank_loads,
+        replicas,
+        routing.rank_token_loads,
+        local_tokens=routing.local_tokens,
+        remote_tokens=routing.remote_tokens,
+        remote_token_transfers=routing.remote_token_transfers,
+    )
+    title = f"{args.dataset}, batch {args.batch_size}, layer {args.layer}"
+    paths = _write_best_load_outputs(best, profile, output_json, title)
+    print(
+        f"Best measured configuration: {best['label']} "
+        f"(serial={float(best['timing']['serial_ms']):.3f} ms)"
+    )
+    for path in paths:
+        print(f"Wrote {path}")
 
 
 def run_worker(args: argparse.Namespace) -> None:
@@ -680,47 +1084,47 @@ def run_worker(args: argparse.Namespace) -> None:
         demands = demands[: args.max_steps]
     if not len(demands):
         raise ValueError("The selected trace contains no forwards")
-    assignments_per_rank = demands.sum(axis=2)
-    if np.any(assignments_per_rank % shape["top_k"]):
+    token_steps, inferred_top_k, topk_reconstruction = _load_token_trace(
+        experiment_dir,
+        trace,
+        args.layer,
+        shape["top_k"],
+    )
+    token_steps = token_steps[: len(demands)]
+    if inferred_top_k != shape["top_k"]:
         raise ValueError(
-            "Trace assignment counts are not divisible by the selected --top-k"
+            f"Trace top-k={inferred_top_k} does not match selected top-k="
+            f"{shape['top_k']}"
         )
-    tokens_per_rank = assignments_per_rank // shape["top_k"]
+    tokens_per_rank = np.asarray(
+        [
+            [len(token_steps[step][rank]) for rank in range(world_size)]
+            for step in range(len(token_steps))
+        ],
+        dtype=np.int64,
+    )
     max_tokens = int(tokens_per_rank.max(initial=0))
     if max_tokens <= 0:
         raise ValueError("The selected trace contains no routed tokens")
-    raw_steps = trace.layers[args.layer].raw_steps[: len(demands)]
-    logical_topk_ids = _load_captured_topk_ids(
-        experiment_dir,
-        args.layer,
-        raw_steps,
-        demands,
-        shape["top_k"],
-        rank,
-    )
-    if logical_topk_ids is None:
-        topk_reconstruction = "synthesized_from_exact_expert_counts"
-        logical_topk_ids = [
-            _synthesize_logical_topk_ids(demand[rank], shape["top_k"])
-            for demand in demands
-        ]
-    else:
-        topk_reconstruction = "captured_token_topk_ids"
 
     latency_config = simulation["latency_model"]
     latency_model = LatencyModel(
-        compute_us_per_assignment=float(latency_config["compute_us_per_assignment"]),
-        communication_us_per_assignment=float(
-            latency_config["communication_us_per_assignment"]
+        compute_us_per_token=_latency_config_value(
+            latency_config,
+            "compute_us_per_token",
+            "compute_us_per_assignment",
+        ),
+        communication_us_per_token=_latency_config_value(
+            latency_config,
+            "communication_us_per_token",
+            "communication_us_per_assignment",
         ),
     )
     plans, capacity_per_rank = _make_local_replay_plans(
         points,
-        demands,
-        logical_topk_ids,
+        token_steps,
         _base_replicas(trace),
         latency_model,
-        int(simulation["routing_chunks"]),
         rank,
     )
     physical_num_experts = capacity_per_rank * world_size
@@ -784,35 +1188,19 @@ def run_worker(args: argparse.Namespace) -> None:
                     num_tokens=local_tokens,
                     num_tokens_across_dp=num_tokens_across_dp,
                 ):
-                    if args.execution_mode == "local_bypass":
-                        record = run_local_bypass_iter(
-                            step_args,
-                            deepep_kernel,
-                            local_kernel,
-                            step_tensors,
-                            plan["physical_topk_ids"][step_index],
-                            distribution="trace_replay",
-                            target_share=0.0,
-                            iteration=replay_iteration,
-                            rank=rank,
-                            world_size=world_size,
-                            device=device,
-                        )
-                    else:
-                        record = run_one_iter(
-                            step_args,
-                            deepep_kernel,
-                            step_tensors,
-                            plan["physical_topk_ids"][step_index],
-                            distribution="trace_replay",
-                            target_share=0.0,
-                            sweep_index=0,
-                            iteration=replay_iteration,
-                            rank=rank,
-                            world_size=world_size,
-                            device=device,
-                            profile_warmup=0,
-                        )
+                    record = run_local_bypass_iter(
+                        step_args,
+                        deepep_kernel,
+                        local_kernel,
+                        step_tensors,
+                        plan["physical_topk_ids"][step_index],
+                        distribution="trace_replay",
+                        target_share=0.0,
+                        iteration=replay_iteration,
+                        rank=rank,
+                        world_size=world_size,
+                        device=device,
+                    )
                 record["replay_iteration"] = replay_iteration
                 record["trace_step_index"] = step_index
                 record["raw_trace_step"] = int(
@@ -856,6 +1244,10 @@ def run_worker(args: argparse.Namespace) -> None:
                             "label": _point_label(point),
                             "policy": point["policy"],
                             "communication_weight": point["communication_weight"],
+                            "requested_extra_replicas": point.get(
+                                "requested_extra_replicas",
+                                point["used_extra_replicas"],
+                            ),
                             "used_extra_replicas": point["used_extra_replicas"],
                             "replica_placements": point["replica_placements"],
                             "offline_estimate": (
@@ -872,6 +1264,14 @@ def run_worker(args: argparse.Namespace) -> None:
                             ),
                             "timing": timing,
                             "forward_timings": forward_timings,
+                            "assignment_profile": _assignment_profile(
+                                plan["expert_rank_loads"],
+                                plan["replicas"],
+                                plan["rank_token_loads"],
+                                local_tokens=plan["local_tokens"],
+                                remote_tokens=plan["remote_tokens"],
+                                remote_token_transfers=plan["remote_token_transfers"],
+                            ),
                         }
                     )
                 plan["physical_topk_ids"] = []
@@ -894,9 +1294,9 @@ def run_worker(args: argparse.Namespace) -> None:
                     "warning": (
                         (
                             "Count-only traces do not retain token top-k tuples. "
-                            "Assignment counts and rank loads are exact, but "
-                            "unique-token communication coalescing is reconstructed. "
-                            if topk_reconstruction.startswith("synthesized")
+                            "The local-bypass routing objective is therefore "
+                            "based on synthesized token rows. "
+                            if topk_reconstruction != "captured_token_topk_ids"
                             else "Captured token top-k tuples are replayed exactly. "
                         )
                         + "This is an operator benchmark, not end-to-end inference "
@@ -910,6 +1310,7 @@ def run_worker(args: argparse.Namespace) -> None:
                         "num_steps": len(demands),
                         "ep_size": world_size,
                         "logical_num_experts": trace.num_experts,
+                        "top_k": shape["top_k"],
                     },
                     "operator_shape": {
                         **shape,
@@ -932,14 +1333,23 @@ def run_worker(args: argparse.Namespace) -> None:
                     plot_path,
                     f"{args.dataset}, batch {args.batch_size}, layer {args.layer}",
                 )
+                best_result = _best_measured_result(output_results)
+                best_load_paths = _write_best_load_outputs(
+                    best_result,
+                    best_result["assignment_profile"],
+                    output_json,
+                    f"{args.dataset}, batch {args.batch_size}, layer {args.layer}",
+                )
                 print(
-                    "policy budget weight dispatch_ms compute_ms combine_ms "
-                    "communication_ms serial_ms pareto"
+                    "policy requested used weight dispatch_ms compute_ms "
+                    "combine_ms communication_ms serial_ms pareto"
                 )
                 for result in output_results:
                     timing = result["timing"]
                     print(
-                        f"{result['policy']} {result['used_extra_replicas']} "
+                        f"{result['policy']} "
+                        f"{result['requested_extra_replicas']} "
+                        f"{result['used_extra_replicas']} "
                         f"{result['communication_weight']} "
                         f"{timing['dispatch_ms']:.3f} {timing['compute_ms']:.3f} "
                         f"{timing['combine_ms']:.3f} "
@@ -950,6 +1360,12 @@ def run_worker(args: argparse.Namespace) -> None:
                 print(f"Wrote {output_json}")
                 print(f"Wrote {csv_path}")
                 print(f"Wrote {plot_path}")
+                print(
+                    f"Best measured configuration: {best_result['label']} "
+                    f"(serial={float(best_result['timing']['serial_ms']):.3f} ms)"
+                )
+                for path in best_load_paths:
+                    print(f"Wrote {path}")
     finally:
         if dist.is_initialized():
             cleanup_dist_env_and_memory()
@@ -957,6 +1373,9 @@ def run_worker(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.plot_only:
+        _plot_existing_best_load(args)
+        return
     if not torch.cuda.is_available():
         raise RuntimeError("MoE trace replay requires CUDA")
     if args.warmup < 0 or args.iters <= 0:

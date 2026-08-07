@@ -35,17 +35,17 @@ else:
 
 @dataclass(frozen=True)
 class LatencyModel:
-    compute_us_per_assignment: float
-    communication_us_per_assignment: float
+    """Linear proxy calibrated in expert-input tokens and communication units."""
+
+    compute_us_per_token: float
+    communication_us_per_token: float
 
     def compute_ms(self, max_rank_assignments: int) -> float:
-        return max_rank_assignments * self.compute_us_per_assignment / 1000.0
+        return max_rank_assignments * self.compute_us_per_token / 1000.0
 
-    def communication_ms(self, bottleneck_assignments: int) -> float:
-        # Dispatch and combine move one activation in each direction.
-        return (
-            2.0 * bottleneck_assignments * self.communication_us_per_assignment / 1000.0
-        )
+    def communication_ms(self, communication_units: int) -> float:
+        # Dispatch and combine each use one transfer to every remote target rank.
+        return 2.0 * communication_units * self.communication_us_per_token / 1000.0
 
 
 @dataclass
@@ -74,6 +74,46 @@ class TraceRoutingResult:
     mean_step_imbalance: float
     p95_step_imbalance: float
     max_step_imbalance: float
+    objective: float
+
+
+@dataclass
+class TokenStepRoutingResult:
+    """Token routing result with compute and communication load units."""
+
+    target_ranks_by_source: list[np.ndarray]
+    rank_assignment_loads: np.ndarray
+    rank_token_loads: np.ndarray
+    expert_rank_loads: np.ndarray
+    source_expert_rank_loads: np.ndarray
+    outbound_remote_tokens: np.ndarray
+    inbound_remote_tokens: np.ndarray
+    local_tokens: int
+    remote_tokens: int
+    remote_token_transfers: int
+    remote_assignments: int
+    compute_latency_ms: float
+    communication_latency_ms: float
+    objective: float
+
+
+@dataclass
+class TokenTraceRoutingResult:
+    rank_assignment_loads: np.ndarray
+    rank_token_loads: np.ndarray
+    expert_rank_loads: np.ndarray
+    remote_assignments: int
+    local_tokens: int
+    remote_tokens: int
+    remote_token_transfers: int
+    bottleneck_remote_token_transfers: int
+    compute_latency_ms: float
+    communication_latency_ms: float
+    serial_latency_ms: float
+    overlap_lower_bound_ms: float
+    mean_step_max_over_mean: float
+    p95_step_max_over_mean: float
+    max_step_max_over_mean: float
     objective: float
 
 
@@ -278,6 +318,389 @@ def _physical_expert_layout(
         for local_slot, expert_id in enumerate(expert_ids):
             physical_ids[expert_id, rank] = rank * capacity_per_rank + local_slot
     return physical_ids, capacity_per_rank
+
+
+def _load_token_trace(
+    experiment_dir: Path,
+    distribution: TraceDistribution,
+    layer_id: int,
+    top_k: int | None = None,
+) -> tuple[list[list[np.ndarray]], int, str]:
+    """Load token top-k rows, reconstructing them from counts when necessary."""
+    import torch
+
+    layer = distribution.layers[layer_id]
+    raw_steps = [int(step) for step in layer.raw_steps]
+    demands = _demand_tensor(distribution, layer_id)
+    records: dict[tuple[int, int], dict[str, Any]] = {}
+    captured_top_k: set[int] = set()
+    count_top_k: set[int] = set()
+    paths = sorted(
+        (experiment_dir / "activations").glob(f"rank_*/step_*_layer_{layer_id:04d}.pt")
+    )
+    for path in paths:
+        record = torch.load(path, map_location="cpu", weights_only=True)
+        rank = int(record["rank"])
+        step = int(record["step"])
+        if rank >= distribution.ep_size or step not in raw_steps:
+            continue
+        records[(rank, step)] = record
+        if "topk_ids" in record:
+            ids = record["topk_ids"]
+            if ids.ndim != 2:
+                raise ValueError(f"Captured top-k tensor in {path} is not 2-D")
+            captured_top_k.add(int(ids.shape[1]))
+        elif "expert_counts" in record:
+            scheduled = int(record.get("num_scheduled_tokens", 0))
+            assignments = int(record["expert_counts"].sum())
+            if scheduled > 0:
+                if assignments % scheduled:
+                    raise ValueError(
+                        f"Cannot infer top-k from {path}: assignments={assignments}, "
+                        f"scheduled_tokens={scheduled}"
+                    )
+                count_top_k.add(assignments // scheduled)
+
+    inferred = captured_top_k | count_top_k
+    if top_k is None:
+        if len(inferred) != 1:
+            raise ValueError(
+                "Could not infer a unique top-k from the trace; pass --top-k"
+            )
+        top_k = inferred.pop()
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    if captured_top_k and captured_top_k != {top_k}:
+        raise ValueError(f"Trace contains captured top-k values {captured_top_k}")
+    if count_top_k and count_top_k != {top_k}:
+        raise ValueError(f"Trace count records imply top-k values {count_top_k}")
+
+    token_steps: list[list[np.ndarray]] = []
+    used_synthesis = False
+    used_capture = False
+    for step_index, raw_step in enumerate(raw_steps):
+        source_rows = []
+        for source in range(distribution.ep_size):
+            expected_counts = demands[step_index, source]
+            record = records.get((source, raw_step))
+            if record is None:
+                if int(expected_counts.sum()):
+                    raise ValueError(
+                        f"Missing trace record for rank={source}, step={raw_step}"
+                    )
+                source_rows.append(np.empty((0, top_k), dtype=np.int64))
+                continue
+            if "topk_ids" in record:
+                ids = record["topk_ids"].to(torch.int64).numpy()
+                if ids.shape[1] != top_k:
+                    raise ValueError(
+                        f"Captured top-k shape {ids.shape} does not match top_k={top_k}"
+                    )
+                if np.any((ids < 0) | (ids >= distribution.num_experts)):
+                    raise ValueError("Captured top-k IDs are outside expert range")
+                actual_counts = np.bincount(
+                    ids.reshape(-1), minlength=distribution.num_experts
+                ).astype(np.int64)
+                used_capture = True
+            else:
+                counts = record["expert_counts"].to(torch.int64).numpy()
+                ids = _synthesize_logical_topk_ids(counts, top_k)
+                actual_counts = counts
+                used_synthesis = True
+            if not np.array_equal(actual_counts, expected_counts):
+                raise ValueError(
+                    f"Trace top-k rows do not match aggregated counts at "
+                    f"rank={source}, step={raw_step}"
+                )
+            source_rows.append(ids)
+        token_steps.append(source_rows)
+    if used_capture and used_synthesis:
+        provenance = "mixed_captured_and_synthesized"
+    elif used_capture:
+        provenance = "captured_token_topk_ids"
+    else:
+        provenance = "synthesized_from_exact_expert_counts"
+    return token_steps, top_k, provenance
+
+
+def _token_route_options(
+    logical_ids: np.ndarray,
+    replicas: list[set[int]],
+    source: int,
+) -> list[tuple[int, tuple[int, ...]]]:
+    ep_size = max(
+        source + 1,
+        max((max(ranks, default=-1) for ranks in replicas), default=-1) + 1,
+    )
+    if not 0 <= source < ep_size:
+        raise ValueError(f"source rank {source} is outside [0, {ep_size})")
+    empty_counts = (0,) * ep_size
+    routes: dict[tuple[int, tuple[int, ...]], tuple[int, ...]] = {(0, empty_counts): ()}
+    for logical_id in np.asarray(logical_ids, dtype=np.int64).tolist():
+        if not 0 <= logical_id < len(replicas):
+            raise ValueError(f"Expert {logical_id} is outside the replica layout")
+        allowed = sorted(
+            replicas[int(logical_id)], key=lambda rank: (rank != source, rank)
+        )
+        if not allowed:
+            raise ValueError(f"Expert {logical_id} has no replica")
+        next_routes: dict[tuple[int, tuple[int, ...]], tuple[int, ...]] = {}
+        for (mask, counts), targets in routes.items():
+            for target in allowed:
+                new_mask = mask | (1 << target)
+                new_counts = list(counts)
+                new_counts[target] += 1
+                route_key = (new_mask, tuple(new_counts))
+                candidate = targets + (target,)
+                previous = next_routes.get(route_key)
+                if previous is None or candidate < previous:
+                    next_routes[route_key] = candidate
+        routes = next_routes
+    return sorted((mask, targets) for (mask, _), targets in routes.items())
+
+
+def _route_targets_to_physical_topk_ids(
+    logical_topk_ids: np.ndarray,
+    target_ranks: np.ndarray,
+    physical_expert_ids: np.ndarray,
+) -> np.ndarray:
+    logical_ids = np.asarray(logical_topk_ids, dtype=np.int64)
+    targets = np.asarray(target_ranks, dtype=np.int64)
+    if logical_ids.shape != targets.shape:
+        raise ValueError("logical_topk_ids and target_ranks must have the same shape")
+    if np.any(logical_ids < 0) or np.any(logical_ids >= physical_expert_ids.shape[0]):
+        raise ValueError("logical_topk_ids contains an out-of-range expert")
+    if np.any(targets < 0) or np.any(targets >= physical_expert_ids.shape[1]):
+        raise ValueError("target_ranks contains an out-of-range rank")
+    physical_ids = physical_expert_ids[logical_ids, targets]
+    if np.any(physical_ids < 0):
+        raise ValueError("A routed expert has no physical replica on its target rank")
+    return physical_ids
+
+
+def _route_token_step(
+    token_ids_by_source: list[np.ndarray],
+    replicas: list[set[int]],
+    latency_model: LatencyModel,
+    *,
+    compute_weight: float,
+    communication_weight: float,
+) -> TokenStepRoutingResult:
+    if not token_ids_by_source:
+        raise ValueError("token_ids_by_source must contain at least one rank")
+    ep_size = len(token_ids_by_source)
+    num_experts = len(replicas)
+    for expert_id, expert_replicas in enumerate(replicas):
+        if not expert_replicas:
+            raise ValueError(f"Expert {expert_id} has no replica")
+        if any(not 0 <= rank < ep_size for rank in expert_replicas):
+            raise ValueError(f"Expert {expert_id} has an out-of-range replica rank")
+    top_k = None
+    for ids in token_ids_by_source:
+        if np.asarray(ids).ndim != 2:
+            raise ValueError("Each token top-k array must have shape [token, top_k]")
+        if top_k is None:
+            top_k = int(np.asarray(ids).shape[1])
+        elif np.asarray(ids).shape[1] != top_k:
+            raise ValueError("All source ranks must use the same top-k")
+    assert top_k is not None
+
+    target_ranks = [
+        np.empty((len(ids), top_k), dtype=np.int64) for ids in token_ids_by_source
+    ]
+    rank_assignment_loads = np.zeros(ep_size, dtype=np.int64)
+    rank_token_loads = np.zeros(ep_size, dtype=np.int64)
+    expert_rank_loads = np.zeros((num_experts, ep_size), dtype=np.int64)
+    source_expert_rank_loads = np.zeros((ep_size, num_experts, ep_size), dtype=np.int64)
+    outbound = np.zeros(ep_size, dtype=np.int64)
+    inbound = np.zeros(ep_size, dtype=np.int64)
+    local_tokens = 0
+    remote_tokens = 0
+    remote_token_transfers = 0
+    remote_assignments = 0
+    option_cache: dict[
+        tuple[int, tuple[int, ...]], list[tuple[int, tuple[int, ...]]]
+    ] = {}
+    pending = []
+    for source, ids in enumerate(token_ids_by_source):
+        for token_index, row in enumerate(np.asarray(ids, dtype=np.int64)):
+            key = (source, tuple(int(expert) for expert in row))
+            options = option_cache.setdefault(
+                key, _token_route_options(row, replicas, source)
+            )
+            pending.append((len(options), source, token_index, row, options))
+    pending.sort(key=lambda item: (item[0], item[1], item[2]))
+
+    for _, source, token_index, row, options in pending:
+        source_bit = 1 << source
+        best = None
+        for mask, targets in options:
+            remote_mask = mask & ~source_bit
+            remote_token = int(bool(remote_mask))
+            remote_transfers = remote_mask.bit_count()
+            projected_assignment_loads = rank_assignment_loads.copy()
+            for target in targets:
+                projected_assignment_loads[target] += 1
+            projected_token_loads = rank_token_loads.copy()
+            for target in range(ep_size):
+                if mask & (1 << target):
+                    projected_token_loads[target] += 1
+            projected_compute = latency_model.compute_ms(
+                int(projected_assignment_loads.max(initial=0))
+            )
+            projected_remote_transfers = remote_token_transfers + remote_transfers
+            projected_communication = latency_model.communication_ms(
+                projected_remote_transfers
+            )
+            score = (
+                compute_weight * projected_compute
+                + communication_weight * projected_communication
+            )
+            key = (
+                score,
+                remote_token,
+                remote_transfers,
+                int(projected_assignment_loads.max(initial=0)),
+                int(projected_token_loads.max(initial=0)),
+                len(targets),
+                targets,
+            )
+            if best is None or key < best[0]:
+                best = (key, mask, targets, remote_token, remote_transfers)
+        assert best is not None
+        _, mask, targets, remote_token, remote_transfers = best
+        target_ranks[source][token_index] = targets
+        for target in range(ep_size):
+            if mask & (1 << target):
+                rank_token_loads[target] += 1
+                if target != source:
+                    inbound[target] += 1
+        remote_mask = mask & ~source_bit
+        outbound[source] += remote_transfers
+        if remote_token:
+            remote_tokens += 1
+        else:
+            local_tokens += 1
+        remote_token_transfers += remote_transfers
+        for expert_id, target in zip(row.tolist(), targets):
+            rank_assignment_loads[target] += 1
+            expert_rank_loads[expert_id, target] += 1
+            source_expert_rank_loads[source, expert_id, target] += 1
+            remote_assignments += int(target != source)
+
+    communication_units = remote_token_transfers
+    compute_latency_ms = latency_model.compute_ms(
+        int(rank_assignment_loads.max(initial=0))
+    )
+    communication_latency_ms = latency_model.communication_ms(communication_units)
+    objective = compute_weight * compute_latency_ms + communication_weight * (
+        communication_latency_ms
+    )
+    return TokenStepRoutingResult(
+        target_ranks_by_source=target_ranks,
+        rank_assignment_loads=rank_assignment_loads,
+        rank_token_loads=rank_token_loads,
+        expert_rank_loads=expert_rank_loads,
+        source_expert_rank_loads=source_expert_rank_loads,
+        outbound_remote_tokens=outbound,
+        inbound_remote_tokens=inbound,
+        local_tokens=local_tokens,
+        remote_tokens=remote_tokens,
+        remote_token_transfers=remote_token_transfers,
+        remote_assignments=remote_assignments,
+        compute_latency_ms=compute_latency_ms,
+        communication_latency_ms=communication_latency_ms,
+        objective=objective,
+    )
+
+
+def _aggregate_token_steps(token_steps: list[list[np.ndarray]]) -> list[np.ndarray]:
+    if not token_steps:
+        raise ValueError("token_steps must not be empty")
+    ep_size = len(token_steps[0])
+    top_k = token_steps[0][0].shape[1] if ep_size else 0
+    return [
+        np.concatenate([step[source] for step in token_steps], axis=0)
+        if any(len(step[source]) for step in token_steps)
+        else np.empty((0, top_k), dtype=np.int64)
+        for source in range(ep_size)
+    ]
+
+
+def _evaluate_token_trace(
+    token_steps: list[list[np.ndarray]],
+    replicas: list[set[int]],
+    latency_model: LatencyModel,
+    *,
+    compute_weight: float,
+    communication_weight: float,
+) -> TokenTraceRoutingResult:
+    if not token_steps:
+        raise ValueError("token_steps must not be empty")
+    ep_size = len(token_steps[0])
+    rank_assignment_loads = np.zeros(ep_size, dtype=np.int64)
+    rank_token_loads = np.zeros(ep_size, dtype=np.int64)
+    expert_rank_loads = np.zeros((len(replicas), ep_size), dtype=np.int64)
+    remote_assignments = 0
+    local_tokens = 0
+    remote_tokens = 0
+    remote_token_transfers = 0
+    bottleneck_remote_token_transfers = 0
+    compute_latency_ms = 0.0
+    communication_latency_ms = 0.0
+    overlap_lower_bound_ms = 0.0
+    objective = 0.0
+    imbalances = []
+    for step in token_steps:
+        routing = _route_token_step(
+            step,
+            replicas,
+            latency_model,
+            compute_weight=compute_weight,
+            communication_weight=communication_weight,
+        )
+        rank_assignment_loads += routing.rank_assignment_loads
+        rank_token_loads += routing.rank_token_loads
+        expert_rank_loads += routing.expert_rank_loads
+        remote_assignments += routing.remote_assignments
+        local_tokens += routing.local_tokens
+        remote_tokens += routing.remote_tokens
+        remote_token_transfers += routing.remote_token_transfers
+        bottleneck_remote_token_transfers += max(
+            int(routing.outbound_remote_tokens.max(initial=0)),
+            int(routing.inbound_remote_tokens.max(initial=0)),
+        )
+        compute_latency_ms += routing.compute_latency_ms
+        communication_latency_ms += routing.communication_latency_ms
+        overlap_lower_bound_ms += max(
+            routing.compute_latency_ms, routing.communication_latency_ms
+        )
+        objective += routing.objective
+        mean_load = float(routing.rank_assignment_loads.mean())
+        imbalances.append(
+            float(routing.rank_assignment_loads.max(initial=0)) / mean_load
+            if mean_load
+            else 0.0
+        )
+    imbalance_array = np.asarray(imbalances, dtype=np.float64)
+    return TokenTraceRoutingResult(
+        rank_assignment_loads=rank_assignment_loads,
+        rank_token_loads=rank_token_loads,
+        expert_rank_loads=expert_rank_loads,
+        remote_assignments=remote_assignments,
+        local_tokens=local_tokens,
+        remote_tokens=remote_tokens,
+        remote_token_transfers=remote_token_transfers,
+        bottleneck_remote_token_transfers=bottleneck_remote_token_transfers,
+        compute_latency_ms=compute_latency_ms,
+        communication_latency_ms=communication_latency_ms,
+        serial_latency_ms=compute_latency_ms + communication_latency_ms,
+        overlap_lower_bound_ms=overlap_lower_bound_ms,
+        mean_step_max_over_mean=float(imbalance_array.mean()),
+        p95_step_max_over_mean=float(np.percentile(imbalance_array, 95)),
+        max_step_max_over_mean=float(imbalance_array.max(initial=0.0)),
+        objective=objective,
+    )
 
 
 def _route_to_physical_topk_ids(
@@ -489,6 +912,270 @@ def _optimize_replicas(
     return replicas, placements
 
 
+def _candidate_token_replicas(
+    aggregate_tokens: list[np.ndarray],
+    replicas: list[set[int]],
+    routing: TokenStepRoutingResult,
+    candidate_limit: int,
+) -> list[tuple[int, int]]:
+    ep_size = len(aggregate_tokens)
+    candidates = [
+        (expert_id, rank)
+        for expert_id in range(len(replicas))
+        for rank in range(ep_size)
+        if rank not in replicas[expert_id]
+    ]
+    if candidate_limit <= 0 or len(candidates) <= candidate_limit:
+        return candidates
+
+    pattern_counts: dict[tuple[int, tuple[int, ...]], int] = {}
+    for source, rows in enumerate(aggregate_tokens):
+        for row in rows:
+            key = (source, tuple(int(expert_id) for expert_id in row))
+            pattern_counts[key] = pattern_counts.get(key, 0) + 1
+    base_communication = {}
+    for key in pattern_counts:
+        source, expert_ids = key
+        base_communication[key] = min(
+            (mask & ~(1 << source)).bit_count()
+            for mask, _ in _token_route_options(
+                np.asarray(expert_ids, dtype=np.int64), replicas, source
+            )
+        )
+
+    def scores(candidate: tuple[int, int]) -> tuple[int, int, int]:
+        expert_id, rank = candidate
+        candidate_replicas = _copy_replicas(replicas)
+        candidate_replicas[expert_id].add(rank)
+        communication_gain = 0
+        fully_local_gain = 0
+        occurrence = 0
+        for (source, expert_ids), count in pattern_counts.items():
+            if expert_id not in expert_ids:
+                continue
+            occurrence += count
+            remote_mask = ~(1 << source)
+            candidate_communication = min(
+                (mask & remote_mask).bit_count()
+                for mask, _ in _token_route_options(
+                    np.asarray(expert_ids, dtype=np.int64),
+                    candidate_replicas,
+                    source,
+                )
+            )
+            previous_communication = base_communication[(source, expert_ids)]
+            communication_gain += (
+                previous_communication - candidate_communication
+            ) * count
+            if previous_communication and not candidate_communication:
+                fully_local_gain += count
+        return communication_gain, fully_local_gain, occurrence
+
+    communication_order = sorted(
+        candidates,
+        key=lambda item: tuple(-score for score in scores(item)) + (item,),
+    )
+    max_rank_load = int(routing.rank_assignment_loads.max(initial=0))
+
+    def balance_score(candidate: tuple[int, int]) -> int:
+        expert_id, rank = candidate
+        headroom = max_rank_load - int(routing.rank_assignment_loads[rank])
+        movable = int(routing.expert_rank_loads[expert_id].max(initial=0))
+        return min(headroom, movable)
+
+    balance_order = sorted(
+        candidates,
+        key=lambda item: (-balance_score(item), item),
+    )
+    shortlist = set(communication_order[:candidate_limit])
+    shortlist.update(balance_order[:candidate_limit])
+    return sorted(shortlist)
+
+
+def _optimize_token_replicas(
+    token_steps: list[list[np.ndarray]],
+    base_replicas: list[set[int]],
+    extra_replica_budget: int,
+    latency_model: LatencyModel,
+    *,
+    compute_weight: float,
+    communication_weight: float,
+    candidate_limit: int,
+) -> tuple[list[set[int]], list[tuple[int, int]]]:
+    if extra_replica_budget < 0:
+        raise ValueError("extra_replica_budget must be non-negative")
+    aggregate_tokens = _aggregate_token_steps(token_steps)
+    replicas = _copy_replicas(base_replicas)
+    placements = []
+    aggregate_routing = _route_token_step(
+        aggregate_tokens,
+        replicas,
+        latency_model,
+        compute_weight=compute_weight,
+        communication_weight=communication_weight,
+    )
+    current = _evaluate_token_trace(
+        token_steps,
+        replicas,
+        latency_model,
+        compute_weight=compute_weight,
+        communication_weight=communication_weight,
+    )
+    best_replicas = _copy_replicas(replicas)
+    best_placements: list[tuple[int, int]] = []
+    best_objective = current.objective
+    for _ in range(extra_replica_budget):
+        candidates = _candidate_token_replicas(
+            aggregate_tokens,
+            replicas,
+            aggregate_routing,
+            candidate_limit,
+        )
+        if not candidates:
+            break
+        best: tuple[tuple[float, int, int], int, int, TokenTraceRoutingResult] | None
+        best = None
+        for expert_id, rank in candidates:
+            candidate_replicas = _copy_replicas(replicas)
+            candidate_replicas[expert_id].add(rank)
+            routing = _evaluate_token_trace(
+                token_steps,
+                candidate_replicas,
+                latency_model,
+                compute_weight=compute_weight,
+                communication_weight=communication_weight,
+            )
+            key = (routing.objective, expert_id, rank)
+            if best is None or key < best[0]:
+                best = (key, expert_id, rank, routing)
+        assert best is not None
+        _, expert_id, rank, current = best
+        replicas[expert_id].add(rank)
+        placements.append((expert_id, rank))
+        if current.objective < best_objective - 1e-12:
+            best_replicas = _copy_replicas(replicas)
+            best_placements = list(placements)
+            best_objective = current.objective
+        aggregate_routing = _route_token_step(
+            aggregate_tokens,
+            replicas,
+            latency_model,
+            compute_weight=compute_weight,
+            communication_weight=communication_weight,
+        )
+    return best_replicas, best_placements
+
+
+def _token_latency_lower_bounds(
+    token_steps: list[list[np.ndarray]],
+    replicas: list[set[int]],
+    latency_model: LatencyModel,
+) -> tuple[float, float]:
+    ep_size = len(token_steps[0])
+    balanced_compute_ms = 0.0
+    communication_ms = 0.0
+    for step in token_steps:
+        total_assignments = 0
+        min_communication_units = 0
+        for source, rows in enumerate(step):
+            source_bit = 1 << source
+            for row in rows:
+                total_assignments += len(row)
+                options = _token_route_options(row, replicas, source)
+                min_communication_units += min(
+                    (mask & ~source_bit).bit_count() for mask, _ in options
+                )
+        balanced_compute_ms += latency_model.compute_ms(
+            ceil(total_assignments / ep_size)
+        )
+        communication_ms += latency_model.communication_ms(min_communication_units)
+    return balanced_compute_ms, communication_ms
+
+
+def _token_result_payload(
+    *,
+    policy: str,
+    communication_weight: float | None,
+    requested_budget: int,
+    placements: list[tuple[int, int]],
+    token_steps: list[list[np.ndarray]],
+    replicas: list[set[int]],
+    latency_model: LatencyModel,
+    routing: TokenTraceRoutingResult,
+    top_k: int,
+    topk_reconstruction: str,
+) -> dict[str, Any]:
+    total_tokens = sum(len(rows) for step in token_steps for rows in step)
+    total_assignments = total_tokens * top_k
+    mean_rank_assignments = float(routing.rank_assignment_loads.mean())
+    mean_rank_tokens = float(routing.rank_token_loads.mean())
+    balanced_compute_lower_bound_ms, communication_lower_bound_ms = (
+        _token_latency_lower_bounds(token_steps, replicas, latency_model)
+    )
+    return {
+        "policy": policy,
+        "communication_weight": communication_weight,
+        "requested_extra_replicas": requested_budget,
+        "used_extra_replicas": len(placements),
+        "replica_placements": [
+            {"expert_id": expert_id, "rank": rank} for expert_id, rank in placements
+        ],
+        "top_k": top_k,
+        "topk_reconstruction": topk_reconstruction,
+        "total_tokens": total_tokens,
+        "total_assignments": total_assignments,
+        "local_tokens": routing.local_tokens,
+        "local_token_percent": (
+            routing.local_tokens / total_tokens * 100.0 if total_tokens else 0.0
+        ),
+        "remote_tokens": routing.remote_tokens,
+        "remote_token_percent": (
+            routing.remote_tokens / total_tokens * 100.0 if total_tokens else 0.0
+        ),
+        "remote_token_transfers": routing.remote_token_transfers,
+        "communication_units": routing.remote_token_transfers,
+        "remote_assignments": routing.remote_assignments,
+        "remote_assignment_percent": (
+            routing.remote_assignments / total_assignments * 100.0
+            if total_assignments
+            else 0.0
+        ),
+        "bottleneck_remote_token_transfers": (
+            routing.bottleneck_remote_token_transfers
+        ),
+        "rank_assignment_loads": routing.rank_assignment_loads.tolist(),
+        "rank_assignment_load_unit": "expert_input_tokens_per_target_rank",
+        "max_rank_assignments": int(routing.rank_assignment_loads.max(initial=0)),
+        "mean_rank_assignments": mean_rank_assignments,
+        "rank_assignment_max_over_mean": (
+            float(routing.rank_assignment_loads.max(initial=0)) / mean_rank_assignments
+            if mean_rank_assignments
+            else 0.0
+        ),
+        "rank_token_loads": routing.rank_token_loads.tolist(),
+        "rank_token_load_unit": "unique_tokens_per_target_rank",
+        "rank_unique_token_loads": routing.rank_token_loads.tolist(),
+        "max_rank_tokens": int(routing.rank_token_loads.max(initial=0)),
+        "mean_rank_tokens": mean_rank_tokens,
+        "rank_token_max_over_mean": (
+            float(routing.rank_token_loads.max(initial=0)) / mean_rank_tokens
+            if mean_rank_tokens
+            else 0.0
+        ),
+        "mean_step_max_over_mean": routing.mean_step_max_over_mean,
+        "p95_step_max_over_mean": routing.p95_step_max_over_mean,
+        "max_step_max_over_mean": routing.max_step_max_over_mean,
+        "estimated_compute_latency_ms": routing.compute_latency_ms,
+        "estimated_communication_latency_ms": routing.communication_latency_ms,
+        "estimated_serial_latency_ms": routing.serial_latency_ms,
+        "estimated_overlap_lower_bound_ms": routing.overlap_lower_bound_ms,
+        "balanced_compute_lower_bound_ms": balanced_compute_lower_bound_ms,
+        "communication_lower_bound_ms": communication_lower_bound_ms,
+        "optimization_objective": routing.objective,
+        "pareto_optimal": False,
+    }
+
+
 def _result_payload(
     *,
     policy: str,
@@ -582,9 +1269,107 @@ def _simulate_layer(
     communication_weights: list[float],
     latency_model: LatencyModel,
     *,
+    experiment_dir: Path,
+    top_k: int | None,
+    candidate_limit: int,
+) -> list[dict[str, Any]]:
+    token_steps, inferred_top_k, topk_reconstruction = _load_token_trace(
+        experiment_dir,
+        distribution,
+        layer_id,
+        top_k,
+    )
+    top_k = inferred_top_k
+    base_replicas = _base_replicas(distribution)
+    max_replicas = distribution.num_experts * (distribution.ep_size - 1)
+    invalid_budgets = [
+        budget for budget in replica_budgets if not 0 <= budget <= max_replicas
+    ]
+    if invalid_budgets:
+        raise ValueError(
+            f"Extra replica budgets must be in [0, {max_replicas}], "
+            f"got {invalid_budgets}"
+        )
+
+    baseline_routing = _evaluate_token_trace(
+        token_steps,
+        base_replicas,
+        latency_model,
+        compute_weight=1.0,
+        communication_weight=1.0,
+    )
+    points = [
+        _token_result_payload(
+            policy="baseline",
+            communication_weight=None,
+            requested_budget=0,
+            placements=[],
+            token_steps=token_steps,
+            replicas=base_replicas,
+            latency_model=latency_model,
+            routing=baseline_routing,
+            top_k=top_k,
+            topk_reconstruction=topk_reconstruction,
+        )
+    ]
+
+    policies = [
+        ("communication_first", 0.0, 1.0, None),
+        ("balance_first", 1.0, 0.0, None),
+        *[
+            ("joint", 1.0, communication_weight, communication_weight)
+            for communication_weight in communication_weights
+        ],
+    ]
+    for budget in replica_budgets:
+        if budget == 0:
+            continue
+        for policy, compute_weight, communication_weight, label_weight in policies:
+            replicas, placements = _optimize_token_replicas(
+                token_steps,
+                base_replicas,
+                budget,
+                latency_model,
+                compute_weight=compute_weight,
+                communication_weight=communication_weight,
+                candidate_limit=candidate_limit,
+            )
+            routing = _evaluate_token_trace(
+                token_steps,
+                replicas,
+                latency_model,
+                compute_weight=compute_weight,
+                communication_weight=communication_weight,
+            )
+            points.append(
+                _token_result_payload(
+                    policy=policy,
+                    communication_weight=label_weight,
+                    requested_budget=budget,
+                    placements=placements,
+                    token_steps=token_steps,
+                    replicas=replicas,
+                    latency_model=latency_model,
+                    routing=routing,
+                    top_k=top_k,
+                    topk_reconstruction=topk_reconstruction,
+                )
+            )
+    _mark_pareto_points(points)
+    return points
+
+
+def _simulate_layer_legacy(
+    distribution: TraceDistribution,
+    layer_id: int,
+    replica_budgets: list[int],
+    communication_weights: list[float],
+    latency_model: LatencyModel,
+    *,
     routing_chunks: int,
     candidate_limit: int,
 ) -> list[dict[str, Any]]:
+    """Keep the previous count-only simulation for old callers."""
     demands = _demand_tensor(distribution, layer_id)
     aggregate_demand = demands.sum(axis=0)
     base_replicas = _base_replicas(distribution)
@@ -732,7 +1517,10 @@ def _plot_pareto(
         if point["policy"] == "joint" and not point["pareto_optimal"]:
             continue
         weight = point["communication_weight"]
-        label = f"B={point['used_extra_replicas']}"
+        requested = point.get("requested_extra_replicas", point["used_extra_replicas"])
+        label = f"B={requested}"
+        if point["used_extra_replicas"] != requested:
+            label += f", used={point['used_extra_replicas']}"
         if weight is not None:
             label += f", w={weight:g}"
         axis.annotate(
@@ -767,6 +1555,8 @@ def _write_csv(experiments: list[dict[str, Any]], output: Path) -> None:
             row = {**context, **point}
             row["replica_placements"] = json.dumps(row["replica_placements"])
             row["rank_assignment_loads"] = json.dumps(row["rank_assignment_loads"])
+            row["rank_token_loads"] = json.dumps(row["rank_token_loads"])
+            row["rank_unique_token_loads"] = json.dumps(row["rank_unique_token_loads"])
             rows.append(row)
     if not rows:
         return
@@ -777,10 +1567,10 @@ def _write_csv(experiments: list[dict[str, Any]], output: Path) -> None:
 
 
 def simulate(args: argparse.Namespace) -> None:
-    if args.compute_us_per_assignment <= 0:
-        raise ValueError("--compute-us-per-assignment must be positive")
-    if args.communication_us_per_assignment <= 0:
-        raise ValueError("--communication-us-per-assignment must be positive")
+    if args.compute_us_per_token <= 0:
+        raise ValueError("--compute-us-per-token must be positive")
+    if args.communication_us_per_token <= 0:
+        raise ValueError("--communication-us-per-token must be positive")
     if args.routing_chunks <= 0:
         raise ValueError("--routing-chunks must be positive")
     if args.candidate_limit < 0:
@@ -804,8 +1594,8 @@ def simulate(args: argparse.Namespace) -> None:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     latency_model = LatencyModel(
-        compute_us_per_assignment=args.compute_us_per_assignment,
-        communication_us_per_assignment=args.communication_us_per_assignment,
+        compute_us_per_token=args.compute_us_per_token,
+        communication_us_per_token=args.communication_us_per_token,
     )
     replica_budgets = list(dict.fromkeys(args.extra_replicas))
     communication_weights = list(dict.fromkeys(args.communication_weights))
@@ -824,9 +1614,11 @@ def simulate(args: argparse.Namespace) -> None:
                     replica_budgets,
                     communication_weights,
                     latency_model,
-                    routing_chunks=args.routing_chunks,
+                    experiment_dir=_experiment_dir(work_dir, dataset, batch_size),
+                    top_k=args.top_k,
                     candidate_limit=args.candidate_limit,
                 )
+                top_k_values = {int(point["top_k"]) for point in points}
                 experiment = {
                     "dataset": dataset,
                     "batch_size_per_rank": batch_size,
@@ -836,6 +1628,7 @@ def simulate(args: argparse.Namespace) -> None:
                     "expert_placement_strategy": (
                         distribution.expert_placement_strategy
                     ),
+                    "top_k": top_k_values.pop(),
                     "points": points,
                 }
                 experiments.append(experiment)
@@ -854,12 +1647,14 @@ def simulate(args: argparse.Namespace) -> None:
         "model": manifest.get("model"),
         "latency_model": {
             **asdict(latency_model),
-            "kind": "linear_assignment_proxy",
+            "kind": "linear_token_proxy",
+            "compute_unit": "token_expert_assignment",
+            "communication_unit": "remote_target_rank_transfer",
             "communication_includes": "dispatch_and_combine",
             "warning": (
-                "Count-only traces do not retain token-level top-k coalescing. "
-                "Calibrate both coefficients before interpreting values as "
-                "hardware latency."
+                "Count-only traces synthesize token top-k rows and cannot preserve "
+                "the original token co-occurrence. Calibrate both coefficients "
+                "before interpreting values as hardware latency."
             ),
         },
         "routing_chunks": args.routing_chunks,
@@ -896,25 +1691,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Communication weights for the joint objective.",
     )
     parser.add_argument(
-        "--compute-us-per-assignment",
-        type=float,
-        default=1.0,
-        help="Calibrated compute cost; the default is a normalized proxy.",
+        "--top-k",
+        type=int,
+        help="Top-k routing width; inferred from captured trace counts when omitted.",
     )
     parser.add_argument(
-        "--communication-us-per-assignment",
+        "--compute-us-per-token",
+        "--compute-us-per-assignment",
+        dest="compute_us_per_token",
         type=float,
         default=1.0,
         help=(
-            "Calibrated one-way remote assignment cost; dispatch and combine "
-            "are both included in reported latency."
+            "Calibrated compute cost per token-expert assignment; the default "
+            "is a proxy."
+        ),
+    )
+    parser.add_argument(
+        "--communication-us-per-token",
+        "--communication-us-per-assignment",
+        dest="communication_us_per_token",
+        type=float,
+        default=1.0,
+        help=(
+            "Calibrated communication cost per remote token unit; dispatch and "
+            "combine are both included."
         ),
     )
     parser.add_argument(
         "--routing-chunks",
         type=int,
         default=8,
-        help="Maximum chunks used to split each source-rank/expert demand block.",
+        help="Deprecated compatibility option; token routing no longer chunks counts.",
     )
     parser.add_argument(
         "--candidate-limit",

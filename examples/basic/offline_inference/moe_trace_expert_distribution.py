@@ -309,7 +309,13 @@ def _collect_experiment(
     activation_dir.mkdir(parents=True, exist_ok=True)
     result_dir.mkdir(parents=True, exist_ok=True)
     (activation_dir / "trace_config.json").write_text(
-        json.dumps({"capture_next_gate_base_logits": False}), encoding="utf-8"
+        json.dumps(
+            {
+                "capture_next_gate_base_logits": False,
+                "capture_topk_ids": True,
+            }
+        ),
+        encoding="utf-8",
     )
 
     floor, remainder = divmod(len(prompts), args.ep_size)
@@ -380,6 +386,7 @@ def _collect_experiment(
         "num_experts": expert_counts.pop(),
         "max_new_tokens": args.max_new_tokens,
         "trace_mode": "expert_distribution",
+        "capture_topk_ids": True,
         "request_batches": request_batches,
         "trace_shape": "topk_ids[token, top_k] per layer and forward step",
     }

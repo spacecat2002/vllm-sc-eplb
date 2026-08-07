@@ -27,6 +27,7 @@ class MoETraceConfig:
     max_steps: int
     capture_next_gate_base_logits: bool
     mode: TraceMode = "lora_training"
+    capture_topk_ids: bool = False
 
     @classmethod
     def from_env(cls) -> MoETraceConfig | None:
@@ -55,6 +56,7 @@ class MoETraceConfig:
                 payload.get("capture_next_gate_base_logits", True)
             ),
             mode=mode,
+            capture_topk_ids=bool(payload.get("capture_topk_ids", False)),
         )
 
 
@@ -167,6 +169,15 @@ class MoETraceCollector:
                     "expert_counts": torch.bincount(
                         logical_ids, minlength=num_experts
                     ).to(device="cpu", dtype=torch.int64),
+                    **(
+                        {
+                            "topk_ids": topk_ids[:num_scheduled_tokens].to(
+                                device="cpu", dtype=torch.int32
+                            )
+                        }
+                        if self.config.capture_topk_ids
+                        else {}
+                    ),
                 },
                 path,
             )
