@@ -485,6 +485,10 @@ def _route_token_step(
     *,
     compute_weight: float,
     communication_weight: float,
+    route_options_cache: dict[
+        tuple[int, tuple[int, ...]], list[tuple[int, tuple[int, ...]]]
+    ]
+    | None = None,
 ) -> TokenStepRoutingResult:
     if not token_ids_by_source:
         raise ValueError("token_ids_by_source must contain at least one rank")
@@ -518,16 +522,15 @@ def _route_token_step(
     remote_tokens = 0
     remote_token_transfers = 0
     remote_assignments = 0
-    option_cache: dict[
-        tuple[int, tuple[int, ...]], list[tuple[int, tuple[int, ...]]]
-    ] = {}
+    option_cache = route_options_cache if route_options_cache is not None else {}
     pending = []
     for source, ids in enumerate(token_ids_by_source):
         for token_index, row in enumerate(np.asarray(ids, dtype=np.int64)):
             key = (source, tuple(int(expert) for expert in row))
-            options = option_cache.setdefault(
-                key, _token_route_options(row, replicas, source)
-            )
+            options = option_cache.get(key)
+            if options is None:
+                options = _token_route_options(row, replicas, source)
+                option_cache[key] = options
             pending.append((len(options), source, token_index, row, options))
     pending.sort(key=lambda item: (item[0], item[1], item[2]))
 
@@ -627,6 +630,43 @@ def _aggregate_token_steps(token_steps: list[list[np.ndarray]]) -> list[np.ndarr
     ]
 
 
+def _limit_token_steps(
+    token_steps: list[list[np.ndarray]], max_tokens: int
+) -> list[list[np.ndarray]]:
+    """Select an evenly spaced token subset for replica-layout search."""
+    if max_tokens <= 0:
+        return token_steps
+    segment_lengths = [len(rows) for step in token_steps for rows in step]
+    total_tokens = sum(segment_lengths)
+    if total_tokens <= max_tokens:
+        return token_steps
+
+    sample_positions = np.linspace(0, total_tokens - 1, max_tokens, dtype=np.int64)
+    segment_ends = np.cumsum(segment_lengths, dtype=np.int64)
+    segment_starts = np.concatenate(
+        (np.asarray([0], dtype=np.int64), segment_ends[:-1])
+    )
+    selected: dict[int, list[int]] = {}
+    for position in sample_positions.tolist():
+        segment = int(np.searchsorted(segment_ends, position, side="right"))
+        selected.setdefault(segment, []).append(int(position - segment_starts[segment]))
+
+    limited_steps: list[list[np.ndarray]] = []
+    segment = 0
+    for step in token_steps:
+        limited_step = []
+        for rows in step:
+            rows_array = np.asarray(rows, dtype=np.int64)
+            offsets = selected.get(segment)
+            if offsets:
+                limited_step.append(rows_array[offsets].copy())
+            else:
+                limited_step.append(np.empty((0, rows_array.shape[1]), dtype=np.int64))
+            segment += 1
+        limited_steps.append(limited_step)
+    return limited_steps
+
+
 def _evaluate_token_trace(
     token_steps: list[list[np.ndarray]],
     replicas: list[set[int]],
@@ -651,6 +691,9 @@ def _evaluate_token_trace(
     overlap_lower_bound_ms = 0.0
     objective = 0.0
     imbalances = []
+    route_options_cache: dict[
+        tuple[int, tuple[int, ...]], list[tuple[int, tuple[int, ...]]]
+    ] = {}
     for step in token_steps:
         routing = _route_token_step(
             step,
@@ -658,6 +701,7 @@ def _evaluate_token_trace(
             latency_model,
             compute_weight=compute_weight,
             communication_weight=communication_weight,
+            route_options_cache=route_options_cache,
         )
         rank_assignment_loads += routing.rank_assignment_loads
         rank_token_loads += routing.rank_token_loads
@@ -1001,10 +1045,12 @@ def _optimize_token_replicas(
     compute_weight: float,
     communication_weight: float,
     candidate_limit: int,
+    search_token_steps: list[list[np.ndarray]] | None = None,
 ) -> tuple[list[set[int]], list[tuple[int, int]]]:
     if extra_replica_budget < 0:
         raise ValueError("extra_replica_budget must be non-negative")
-    aggregate_tokens = _aggregate_token_steps(token_steps)
+    optimization_steps = search_token_steps or token_steps
+    aggregate_tokens = _aggregate_token_steps(optimization_steps)
     replicas = _copy_replicas(base_replicas)
     placements = []
     aggregate_routing = _route_token_step(
@@ -1015,7 +1061,7 @@ def _optimize_token_replicas(
         communication_weight=communication_weight,
     )
     current = _evaluate_token_trace(
-        token_steps,
+        optimization_steps,
         replicas,
         latency_model,
         compute_weight=compute_weight,
@@ -1039,7 +1085,7 @@ def _optimize_token_replicas(
             candidate_replicas = _copy_replicas(replicas)
             candidate_replicas[expert_id].add(rank)
             routing = _evaluate_token_trace(
-                token_steps,
+                optimization_steps,
                 candidate_replicas,
                 latency_model,
                 compute_weight=compute_weight,
@@ -1272,6 +1318,7 @@ def _simulate_layer(
     experiment_dir: Path,
     top_k: int | None,
     candidate_limit: int,
+    search_max_tokens: int,
 ) -> list[dict[str, Any]]:
     token_steps, inferred_top_k, topk_reconstruction = _load_token_trace(
         experiment_dir,
@@ -1280,6 +1327,14 @@ def _simulate_layer(
         top_k,
     )
     top_k = inferred_top_k
+    search_token_steps = _limit_token_steps(token_steps, search_max_tokens)
+    search_tokens = sum(len(rows) for step in search_token_steps for rows in step)
+    total_tokens = sum(len(rows) for step in token_steps for rows in step)
+    if search_tokens < total_tokens:
+        print(
+            f"  layout search uses {search_tokens}/{total_tokens} tokens",
+            flush=True,
+        )
     base_replicas = _base_replicas(distribution)
     max_replicas = distribution.num_experts * (distribution.ep_size - 1)
     invalid_budgets = [
@@ -1325,6 +1380,11 @@ def _simulate_layer(
         if budget == 0:
             continue
         for policy, compute_weight, communication_weight, label_weight in policies:
+            print(
+                f"  searching policy={policy}, budget={budget}, "
+                f"communication_weight={label_weight}",
+                flush=True,
+            )
             replicas, placements = _optimize_token_replicas(
                 token_steps,
                 base_replicas,
@@ -1333,6 +1393,7 @@ def _simulate_layer(
                 compute_weight=compute_weight,
                 communication_weight=communication_weight,
                 candidate_limit=candidate_limit,
+                search_token_steps=search_token_steps,
             )
             routing = _evaluate_token_trace(
                 token_steps,
@@ -1575,6 +1636,8 @@ def simulate(args: argparse.Namespace) -> None:
         raise ValueError("--routing-chunks must be positive")
     if args.candidate_limit < 0:
         raise ValueError("--candidate-limit must be non-negative")
+    if args.search_max_tokens < 0:
+        raise ValueError("--search-max-tokens must be non-negative")
     if any(weight < 0 for weight in args.communication_weights):
         raise ValueError("--communication-weights must be non-negative")
 
@@ -1617,6 +1680,7 @@ def simulate(args: argparse.Namespace) -> None:
                     experiment_dir=_experiment_dir(work_dir, dataset, batch_size),
                     top_k=args.top_k,
                     candidate_limit=args.candidate_limit,
+                    search_max_tokens=args.search_max_tokens,
                 )
                 top_k_values = {int(point["top_k"]) for point in points}
                 experiment = {
@@ -1659,6 +1723,7 @@ def simulate(args: argparse.Namespace) -> None:
         },
         "routing_chunks": args.routing_chunks,
         "candidate_limit": args.candidate_limit,
+        "search_max_tokens": args.search_max_tokens,
         "experiments": experiments,
     }
     json_path = output_dir / "replica_simulation.json"
@@ -1730,6 +1795,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Candidates retained from each locality/load shortlist per greedy "
             "step; use 0 for exhaustive search."
+        ),
+    )
+    parser.add_argument(
+        "--search-max-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Maximum tokens used while searching replica layouts. The final "
+            "metrics still replay the complete trace; 0 uses all tokens."
         ),
     )
     return parser.parse_args(argv)

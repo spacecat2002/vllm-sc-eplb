@@ -253,6 +253,28 @@ source-rank demand and temporal load variation. `--extra-replicas` is a budget,
 not a requirement: `used_extra_replicas` can be smaller when a shorter placement
 prefix has the best objective.
 
+For large traces, layout search can be bounded without changing the reported
+metrics. `--search-max-tokens N` uses an evenly spaced subset of at most `N`
+tokens while choosing placements; the selected layout is then replayed on the
+complete trace for the output metrics. For example:
+
+```bash
+.venv/bin/python \
+  examples/basic/offline_inference/moe_trace_replica_simulation.py \
+  --work-dir /tmp/qwen3_expert_distribution \
+  --datasets math \
+  --batch-sizes 4 \
+  --layers 23 \
+  --extra-replicas 0 4 8 \
+  --communication-weights 0.3 1 3 \
+  --candidate-limit 8 \
+  --search-max-tokens 4096
+```
+
+The default `--search-max-tokens 0` preserves exhaustive trace replay during
+search. A smaller `--candidate-limit` also reduces the number of candidate
+expert/rank placements evaluated at each greedy step.
+
 `estimated_compute_latency_ms` sums the maximum expert-input token count across
 ranks for each recorded forward. This is the token-expert assignment count used
 by the real expert kernel. `estimated_communication_latency_ms` charges the sum
