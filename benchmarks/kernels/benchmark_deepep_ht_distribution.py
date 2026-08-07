@@ -68,6 +68,7 @@ import math
 import os
 import random
 import statistics
+import sys
 import time
 from collections import defaultdict
 from collections.abc import Callable
@@ -668,6 +669,10 @@ def _load_solver_trace(
     trace_dir = args.trace_dir.expanduser().resolve()
     if not trace_dir.is_dir():
         raise FileNotFoundError(trace_dir)
+
+    repo_root = str(Path(__file__).resolve().parents[2])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
 
     from examples.basic.offline_inference.moe_trace_expert_distribution import (
         _aggregate_trace,
