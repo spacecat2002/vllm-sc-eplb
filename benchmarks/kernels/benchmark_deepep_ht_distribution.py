@@ -62,7 +62,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import heapq
-import itertools
 import json
 import math
 import os
@@ -207,16 +206,6 @@ class SolverRouteAllocation:
     group: SolverTokenGroup
     pattern: SolverRoutePattern
     count: int
-
-
-@dataclass(frozen=True)
-class SolverSearchSpace:
-    groups: tuple[SolverTokenGroup, ...]
-    home_by_expert: tuple[int, ...]
-    hosts_by_expert: tuple[tuple[int, ...], ...]
-    replica_candidates: tuple[tuple[int, int], ...]
-    patterns_by_group: tuple[tuple[SolverRoutePattern, ...], ...]
-    complete: bool
 
 
 def apply_model_config(args: argparse.Namespace) -> argparse.Namespace:
@@ -373,8 +362,9 @@ def parse_args() -> argparse.Namespace:
         "--solver-only",
         action="store_true",
         help=(
-            "Compare the original layout, UltraEP Algorithm 1, and a joint "
-            "MILP plan for one captured trace step without CUDA or DeepEP."
+            "Compare the original layout, UltraEP Algorithm 1, and a fast "
+            "communication-aware quota plan for one captured trace step "
+            "without CUDA or DeepEP."
         ),
     )
     parser.add_argument(
@@ -406,52 +396,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--solver-redundant-slots", type=int, default=2)
     parser.add_argument(
-        "--solver-exact",
-        action="store_true",
+        "--solver-fast-capacity-tolerance",
+        type=float,
+        default=0.1,
         help=(
-            "Enumerate every loaded expert on every non-home rank. This can "
-            "prove a global optimum only when the MILP finishes successfully."
+            "Fast planner may prefer a communication-efficient target whose "
+            "quota capacity is within this fraction of the largest candidate."
         ),
     )
-    parser.add_argument(
-        "--solver-candidate-experts",
-        type=int,
-        default=6,
-        help=(
-            "Number of hottest logical experts eligible for replication; zero "
-            "means every loaded expert. Ignored by --solver-exact."
-        ),
-    )
-    parser.add_argument(
-        "--solver-host-candidates",
-        type=int,
-        default=2,
-        help=(
-            "Maximum non-home ranks considered for each candidate expert. "
-            "Zero means every rank. Ignored by --solver-exact."
-        ),
-    )
-    parser.add_argument(
-        "--solver-max-patterns-per-group",
-        type=int,
-        default=4096,
-        help=(
-            "Maximum complete physical-host route patterns enumerated for one "
-            "compressed token group; zero means unlimited. Ignored by "
-            "--solver-exact."
-        ),
-    )
-    parser.add_argument(
-        "--solver-max-total-patterns",
-        type=int,
-        default=1_000_000,
-        help=(
-            "Fail before MILP construction when route patterns exceed this "
-            "safety limit; zero disables the limit."
-        ),
-    )
-    parser.add_argument("--solver-time-limit", type=float, default=60.0)
-    parser.add_argument("--solver-mip-gap", type=float, default=0.0)
     parser.add_argument(
         "--solver-compute-weight",
         type=float,
@@ -757,126 +709,6 @@ def _load_solver_trace(
     )
 
 
-def _make_solver_search_space(
-    groups: tuple[SolverTokenGroup, ...],
-    home_by_expert: tuple[int, ...],
-    world_size: int,
-    args: argparse.Namespace,
-) -> SolverSearchSpace:
-    expert_loads = [0] * len(home_by_expert)
-    source_expert_loads = [[0] * len(home_by_expert) for _ in range(world_size)]
-    for group in groups:
-        for expert in group.experts:
-            expert_loads[expert] += group.count
-            source_expert_loads[group.source_rank][expert] += group.count
-
-    loaded_experts = [expert for expert, load in enumerate(expert_loads) if load > 0]
-    if args.solver_exact or args.solver_candidate_experts == 0:
-        candidate_experts = loaded_experts
-    else:
-        candidate_experts = sorted(
-            loaded_experts,
-            key=lambda expert: (-expert_loads[expert], expert),
-        )[: args.solver_candidate_experts]
-
-    initial_rank_loads = [0] * world_size
-    for expert, load in enumerate(expert_loads):
-        initial_rank_loads[home_by_expert[expert]] += load
-
-    hosts_by_expert = []
-    for expert, home in enumerate(home_by_expert):
-        remote_hosts: list[int] = []
-        if expert in candidate_experts:
-            remote_hosts = [rank for rank in range(world_size) if rank != home]
-            remote_hosts.sort(
-                key=lambda rank: (
-                    -source_expert_loads[rank][expert],
-                    initial_rank_loads[rank],
-                    rank,
-                )
-            )
-            if not args.solver_exact and args.solver_host_candidates > 0:
-                remote_hosts = remote_hosts[: args.solver_host_candidates]
-        hosts_by_expert.append((home, *remote_hosts))
-
-    replica_candidates = tuple(
-        (expert, rank)
-        for expert, hosts in enumerate(hosts_by_expert)
-        for rank in hosts
-        if rank != home_by_expert[expert]
-    )
-    pattern_limit = 0 if args.solver_exact else args.solver_max_patterns_per_group
-    patterns_by_group = []
-    total_patterns = 0
-    truncated = False
-    for group in groups:
-        host_choices = [hosts_by_expert[expert] for expert in group.experts]
-        patterns = []
-        for hosts in itertools.product(*host_choices):
-            rank_counts = [0] * world_size
-            for rank in hosts:
-                rank_counts[rank] += 1
-            remote_destinations = tuple(
-                rank for rank in sorted(set(hosts)) if rank != group.source_rank
-            )
-            patterns.append(
-                SolverRoutePattern(
-                    hosts=tuple(hosts),
-                    rank_assignment_counts=tuple(rank_counts),
-                    remote_destinations=remote_destinations,
-                )
-            )
-        if pattern_limit and len(patterns) > pattern_limit:
-            truncated = True
-            retained = heapq.nsmallest(
-                pattern_limit,
-                patterns,
-                key=lambda pattern: (
-                    len(pattern.remote_destinations),
-                    max(pattern.rank_assignment_counts),
-                    sum(
-                        rank != home_by_expert[expert]
-                        for expert, rank in zip(group.experts, pattern.hosts)
-                    ),
-                    pattern.hosts,
-                ),
-            )
-            home_hosts = tuple(home_by_expert[expert] for expert in group.experts)
-            if not any(pattern.hosts == home_hosts for pattern in retained):
-                home_pattern = next(
-                    pattern for pattern in patterns if pattern.hosts == home_hosts
-                )
-                retained[-1] = home_pattern
-            patterns = retained
-        patterns_by_group.append(tuple(patterns))
-        total_patterns += len(patterns)
-        if (
-            args.solver_max_total_patterns > 0
-            and total_patterns > args.solver_max_total_patterns
-        ):
-            raise ValueError(
-                f"Solver route patterns exceed --solver-max-total-patterns="
-                f"{args.solver_max_total_patterns}. Reduce candidate experts or "
-                "host candidates, lower --solver-max-patterns-per-group, or set "
-                "--solver-max-total-patterns 0 after checking memory use."
-            )
-
-    complete = (
-        args.solver_exact
-        and not truncated
-        and len(candidate_experts) == len(loaded_experts)
-        and all(len(hosts_by_expert[expert]) == world_size for expert in loaded_experts)
-    )
-    return SolverSearchSpace(
-        groups=groups,
-        home_by_expert=home_by_expert,
-        hosts_by_expert=tuple(hosts_by_expert),
-        replica_candidates=replica_candidates,
-        patterns_by_group=tuple(patterns_by_group),
-        complete=complete,
-    )
-
-
 def _baseline_solver_allocations(
     groups: tuple[SolverTokenGroup, ...],
     home_by_expert: tuple[int, ...],
@@ -911,11 +743,14 @@ def _ultraep_quotas(
     redundant_slots: int,
     beta: float,
     min_quota: int,
+    communication_args: argparse.Namespace | None = None,
 ) -> tuple[list[list[int]], int]:
     expert_loads = [0] * len(home_by_expert)
+    source_expert_loads = [[0] * len(home_by_expert) for _ in range(world_size)]
     for group in groups:
         for expert in group.experts:
             expert_loads[expert] += group.count
+            source_expert_loads[group.source_rank][expert] += group.count
     initial_rank_loads = [0] * world_size
     experts_by_home = [[] for _ in range(world_size)]
     for expert, load in enumerate(expert_loads):
@@ -942,6 +777,8 @@ def _ultraep_quotas(
         excess = [max(load - threshold, 0) for load in initial_rank_loads]
         slack = [max(threshold - load, 0) for load in initial_rank_loads]
         used_slots = [0] * world_size
+        estimated_incoming = [0] * world_size
+        replicas_from_home = [0] * world_size
         overloaded = sorted(range(world_size), key=lambda rank: (-excess[rank], rank))
         for source_rank in overloaded:
             experts = sorted(
@@ -961,7 +798,50 @@ def _ultraep_quotas(
                     ]
                     if not admissible:
                         break
-                    target_rank = max(admissible, key=lambda rank: (slack[rank], -rank))
+                    if communication_args is None:
+                        target_rank = max(
+                            admissible, key=lambda rank: (slack[rank], -rank)
+                        )
+                    else:
+                        capacities = {
+                            rank: min(excess[source_rank], slack[rank], capacity)
+                            for rank in admissible
+                        }
+                        largest_capacity = max(capacities.values())
+                        minimum_capacity = math.ceil(
+                            largest_capacity
+                            * (1.0 - communication_args.solver_fast_capacity_tolerance)
+                        )
+                        near_max = [
+                            rank
+                            for rank in admissible
+                            if capacities[rank] >= minimum_capacity
+                        ]
+
+                        candidate_scores = {}
+                        for rank in near_max:
+                            quota = capacities[rank]
+                            local_fill = min(quota, source_expert_loads[rank][expert])
+                            remote = quota - local_fill
+                            projected_incoming = max(
+                                max(estimated_incoming, default=0),
+                                estimated_incoming[rank] + remote,
+                            )
+                            projected_fanout = max(
+                                max(replicas_from_home, default=0),
+                                replicas_from_home[source_rank] + 1,
+                            )
+                            score = (
+                                communication_args.solver_communication_weight
+                                * projected_incoming
+                                + communication_args.solver_link_weight * remote
+                                + communication_args.solver_remote_weight * remote
+                                + communication_args.solver_replica_weight
+                                * projected_fanout
+                            )
+                            candidate_scores[rank] = (score, rank)
+
+                        target_rank = min(near_max, key=candidate_scores.__getitem__)
                     delta = min(excess[source_rank], slack[target_rank], capacity)
                     if delta < min_quota:
                         break
@@ -971,6 +851,12 @@ def _ultraep_quotas(
                     slack[target_rank] -= delta
                     capacity -= delta
                     used_slots[target_rank] += 1
+                    if communication_args is not None:
+                        local_fill = min(
+                            delta, source_expert_loads[target_rank][expert]
+                        )
+                        estimated_incoming[target_rank] += delta - local_fill
+                        replicas_from_home[source_rank] += 1
                 if not excess[source_rank]:
                     break
         return quotas if not any(excess) else None
@@ -994,6 +880,7 @@ def _ultraep_solver_allocations(
     redundant_slots: int,
     beta: float,
     min_quota: int,
+    communication_args: argparse.Namespace | None = None,
 ) -> tuple[list[SolverRouteAllocation], list[tuple[int, int]], int]:
     quotas, threshold = _ultraep_quotas(
         groups,
@@ -1002,13 +889,14 @@ def _ultraep_solver_allocations(
         redundant_slots,
         beta,
         min_quota,
+        communication_args,
     )
     source_expert_loads = [[0] * len(home_by_expert) for _ in range(world_size)]
     for group in groups:
         for expert in group.experts:
             source_expert_loads[group.source_rank][expert] += group.count
 
-    source_targets: dict[tuple[int, int], list[int]] = {}
+    source_target_runs: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
     for expert in range(len(home_by_expert)):
         demand = [source_expert_loads[source][expert] for source in range(world_size)]
         capacity = quotas[expert].copy()
@@ -1033,24 +921,52 @@ def _ultraep_solver_allocations(
         if any(capacity):
             raise RuntimeError(f"UltraEP reroute left unused quota for expert {expert}")
         for source in range(world_size):
-            targets = []
-            for target in sorted(
-                range(world_size), key=lambda rank: (rank != source, rank)
-            ):
-                targets.extend([target] * assignments[source][target])
-            source_targets[source, expert] = targets
+            source_target_runs[source, expert] = tuple(
+                (target, assignments[source][target])
+                for target in sorted(
+                    range(world_size), key=lambda rank: (rank != source, rank)
+                )
+                if assignments[source][target]
+            )
 
-    cursors = defaultdict(int)
+    run_indices = defaultdict(int)
+    run_remaining: dict[tuple[int, int], int] = {}
     allocation_counts: dict[tuple[int, tuple[int, ...]], int] = defaultdict(int)
     for group_index, group in enumerate(groups):
-        for _ in range(group.count):
+        group_remaining = group.count
+        while group_remaining:
             hosts = []
+            available = []
+            keys = []
             for expert in group.experts:
                 key = (group.source_rank, expert)
-                cursor = cursors[key]
-                hosts.append(source_targets[key][cursor])
-                cursors[key] += 1
-            allocation_counts[group_index, tuple(hosts)] += 1
+                runs = source_target_runs[key]
+                run_index = run_indices[key]
+                if run_index >= len(runs):
+                    raise RuntimeError(
+                        f"UltraEP reroute exhausted assignments for {key}"
+                    )
+                target, run_count = runs[run_index]
+                hosts.append(target)
+                available.append(run_remaining.get(key, run_count))
+                keys.append(key)
+            chunk = min(group_remaining, *available)
+            allocation_counts[group_index, tuple(hosts)] += chunk
+            group_remaining -= chunk
+            for key, count in zip(keys, available):
+                count -= chunk
+                if count:
+                    run_remaining[key] = count
+                else:
+                    run_remaining.pop(key, None)
+                    run_indices[key] += 1
+
+    if any(
+        run_indices[key] != len(runs)
+        for key, runs in source_target_runs.items()
+        if runs
+    ):
+        raise RuntimeError("UltraEP reroute left unconsumed assignments")
 
     allocations = []
     for (group_index, hosts), count in sorted(allocation_counts.items()):
@@ -1171,255 +1087,6 @@ def _solver_metrics(
     }
 
 
-def _solve_joint_milp(
-    search: SolverSearchSpace,
-    world_size: int,
-    args: argparse.Namespace,
-) -> tuple[list[SolverRouteAllocation], list[tuple[int, int]], dict[str, Any]]:
-    try:
-        import numpy as np
-        from scipy.optimize import Bounds, LinearConstraint, milp
-        from scipy.sparse import coo_array
-    except ImportError as error:
-        raise RuntimeError(
-            "The joint solver requires SciPy. Install vLLM benchmark extras "
-            "with `VLLM_USE_PRECOMPILED=1 uv pip install -e '.[bench]' "
-            "--torch-backend=auto`."
-        ) from error
-
-    route_variables: dict[tuple[int, int], int] = {}
-    variable_upper_bounds: list[float] = []
-    objective: list[float] = []
-    for group_index, (group, patterns) in enumerate(
-        zip(search.groups, search.patterns_by_group)
-    ):
-        for pattern_index, pattern in enumerate(patterns):
-            route_variables[group_index, pattern_index] = len(objective)
-            variable_upper_bounds.append(float(group.count))
-            objective.append(
-                args.solver_remote_weight * len(pattern.remote_destinations)
-            )
-    placement_variables = {}
-    for placement in search.replica_candidates:
-        placement_variables[placement] = len(objective)
-        variable_upper_bounds.append(1.0)
-        objective.append(0.0)
-    compute_max_variable = len(objective)
-    objective.append(args.solver_compute_weight)
-    variable_upper_bounds.append(
-        float(sum(group.count * len(group.experts) for group in search.groups))
-    )
-    endpoint_max_variable = len(objective)
-    objective.append(args.solver_communication_weight)
-    variable_upper_bounds.append(
-        float(sum(group.count for group in search.groups) * (world_size - 1))
-    )
-    link_max_variable = len(objective)
-    objective.append(args.solver_link_weight)
-    variable_upper_bounds.append(float(sum(group.count for group in search.groups)))
-    replica_max_variable = len(objective)
-    objective.append(args.solver_replica_weight)
-    variable_upper_bounds.append(float(len(search.replica_candidates)))
-
-    row_indices: list[int] = []
-    column_indices: list[int] = []
-    values: list[float] = []
-    lower_bounds: list[float] = []
-    upper_bounds: list[float] = []
-
-    def add_constraint(
-        coefficients: dict[int, float], lower: float, upper: float
-    ) -> None:
-        row = len(lower_bounds)
-        for column, value in coefficients.items():
-            if value:
-                row_indices.append(row)
-                column_indices.append(column)
-                values.append(float(value))
-        lower_bounds.append(float(lower))
-        upper_bounds.append(float(upper))
-
-    for group_index, group in enumerate(search.groups):
-        add_constraint(
-            {
-                route_variables[group_index, pattern_index]: 1.0
-                for pattern_index in range(len(search.patterns_by_group[group_index]))
-            },
-            group.count,
-            group.count,
-        )
-
-    for group_index, (group, patterns) in enumerate(
-        zip(search.groups, search.patterns_by_group)
-    ):
-        for pattern_index, pattern in enumerate(patterns):
-            route_variable = route_variables[group_index, pattern_index]
-            required = {
-                (expert, rank)
-                for expert, rank in zip(group.experts, pattern.hosts)
-                if rank != search.home_by_expert[expert]
-            }
-            for placement in required:
-                add_constraint(
-                    {
-                        route_variable: 1.0,
-                        placement_variables[placement]: -float(group.count),
-                    },
-                    -math.inf,
-                    0.0,
-                )
-
-    for rank in range(world_size):
-        add_constraint(
-            {
-                variable: 1.0
-                for (expert, target), variable in placement_variables.items()
-                if target == rank
-            },
-            -math.inf,
-            args.solver_redundant_slots,
-        )
-
-    for home_rank in range(world_size):
-        coefficients = {replica_max_variable: -1.0}
-        for (expert, _), variable in placement_variables.items():
-            if search.home_by_expert[expert] == home_rank:
-                coefficients[variable] = 1.0
-        add_constraint(coefficients, -math.inf, 0.0)
-
-    for rank in range(world_size):
-        coefficients = {compute_max_variable: -1.0}
-        for group_index, patterns in enumerate(search.patterns_by_group):
-            for pattern_index, pattern in enumerate(patterns):
-                coefficients[route_variables[group_index, pattern_index]] = (
-                    pattern.rank_assignment_counts[rank]
-                )
-        add_constraint(coefficients, -math.inf, 0.0)
-
-    for source in range(world_size):
-        coefficients = {endpoint_max_variable: -1.0}
-        for group_index, (group, patterns) in enumerate(
-            zip(search.groups, search.patterns_by_group)
-        ):
-            if group.source_rank != source:
-                continue
-            for pattern_index, pattern in enumerate(patterns):
-                coefficients[route_variables[group_index, pattern_index]] = len(
-                    pattern.remote_destinations
-                )
-        add_constraint(coefficients, -math.inf, 0.0)
-
-    for target in range(world_size):
-        coefficients = {endpoint_max_variable: -1.0}
-        for group_index, patterns in enumerate(search.patterns_by_group):
-            for pattern_index, pattern in enumerate(patterns):
-                if target in pattern.remote_destinations:
-                    coefficients[route_variables[group_index, pattern_index]] = 1.0
-        add_constraint(coefficients, -math.inf, 0.0)
-
-    for source in range(world_size):
-        for target in range(world_size):
-            if source == target:
-                continue
-            coefficients = {link_max_variable: -1.0}
-            for group_index, (group, patterns) in enumerate(
-                zip(search.groups, search.patterns_by_group)
-            ):
-                if group.source_rank != source:
-                    continue
-                for pattern_index, pattern in enumerate(patterns):
-                    if target in pattern.remote_destinations:
-                        coefficients[route_variables[group_index, pattern_index]] = 1.0
-            add_constraint(coefficients, -math.inf, 0.0)
-
-    for placement, placement_variable in placement_variables.items():
-        expert, target = placement
-        coefficients = {placement_variable: -float(args.solver_min_quota)}
-        for group_index, (group, patterns) in enumerate(
-            zip(search.groups, search.patterns_by_group)
-        ):
-            if expert not in group.experts:
-                continue
-            expert_slot = group.experts.index(expert)
-            for pattern_index, pattern in enumerate(patterns):
-                if pattern.hosts[expert_slot] == target:
-                    coefficients[route_variables[group_index, pattern_index]] = 1.0
-        add_constraint(coefficients, 0.0, math.inf)
-
-    num_variables = len(objective)
-    matrix = coo_array(
-        (values, (row_indices, column_indices)),
-        shape=(len(lower_bounds), num_variables),
-    ).tocsr()
-    result = milp(
-        c=np.asarray(objective, dtype=np.float64),
-        integrality=np.ones(num_variables, dtype=np.uint8),
-        bounds=Bounds(
-            np.zeros(num_variables, dtype=np.float64),
-            np.asarray(variable_upper_bounds, dtype=np.float64),
-        ),
-        constraints=LinearConstraint(
-            matrix,
-            np.asarray(lower_bounds, dtype=np.float64),
-            np.asarray(upper_bounds, dtype=np.float64),
-        ),
-        options={
-            "time_limit": args.solver_time_limit,
-            "mip_rel_gap": args.solver_mip_gap,
-            "presolve": True,
-        },
-    )
-    if result.x is None:
-        raise RuntimeError(f"Joint MILP did not find a feasible plan: {result.message}")
-
-    allocations = []
-    for group_index, (group, patterns) in enumerate(
-        zip(search.groups, search.patterns_by_group)
-    ):
-        routed = 0
-        for pattern_index, pattern in enumerate(patterns):
-            count = int(round(result.x[route_variables[group_index, pattern_index]]))
-            if count:
-                allocations.append(SolverRouteAllocation(group, pattern, count))
-                routed += count
-        if routed != group.count:
-            raise RuntimeError(
-                f"MILP route rounding changed group count {group.count} to {routed}"
-            )
-    placements = [
-        placement
-        for placement, variable in placement_variables.items()
-        if result.x[variable] > 0.5
-    ]
-    status = "optimal" if result.status == 0 else "feasible_not_proven"
-    mip_gap = getattr(result, "mip_gap", None)
-    mip_dual_bound = getattr(result, "mip_dual_bound", None)
-    mip_node_count = getattr(result, "mip_node_count", None)
-    return (
-        allocations,
-        placements,
-        {
-            "status": status,
-            "message": result.message,
-            "search_space_complete": search.complete,
-            "global_optimum_proven": result.status == 0 and search.complete,
-            "restricted_optimum_proven": result.status == 0,
-            "mip_gap": float(mip_gap) if mip_gap is not None else None,
-            "mip_dual_bound": (
-                float(mip_dual_bound) if mip_dual_bound is not None else None
-            ),
-            "mip_node_count": (
-                int(mip_node_count) if mip_node_count is not None else None
-            ),
-            "milp_objective": float(result.fun),
-            "variables": num_variables,
-            "constraints": len(lower_bounds),
-            "route_patterns": sum(map(len, search.patterns_by_group)),
-            "replica_candidates": len(search.replica_candidates),
-        },
-    )
-
-
 def _solver_plan_payload(
     name: str,
     allocations: list[SolverRouteAllocation],
@@ -1460,7 +1127,7 @@ def _solver_plan_payload(
 
 def _print_solver_plans(plans: list[dict[str, Any]]) -> None:
     print(
-        "solver_plan status scope objective rank_max rank_skew endpoint_max "
+        "solver_plan status scope solve_ms objective rank_max rank_skew endpoint_max "
         "destination_skew link_max link_skew remote_transfers replicas "
         "replica_source_fanout versus_ultraep"
     )
@@ -1480,6 +1147,7 @@ def _print_solver_plans(plans: list[dict[str, Any]]) -> None:
         ratio = metrics["objective"] / ultraep_objective if ultraep_objective else 1.0
         print(
             f"solver_plan {plan['name']} {status} {scope} "
+            f"{solver.get('solve_ms', 0.0):.3f} "
             f"{metrics['objective']:.3f} "
             f"{metrics['max_rank_assignments']} "
             f"{metrics['rank_load_max_over_mean']:.3f} "
@@ -1498,22 +1166,12 @@ def run_solver_only(args: argparse.Namespace) -> None:
         raise ValueError("--solver-redundant-slots must be non-negative")
     if args.solver_world_size is not None and args.solver_world_size < 2:
         raise ValueError("--solver-world-size must be at least two")
-    integer_limits = (
-        args.solver_candidate_experts,
-        args.solver_host_candidates,
-        args.solver_max_patterns_per_group,
-        args.solver_max_total_patterns,
-    )
-    if any(value < 0 for value in integer_limits):
-        raise ValueError("Solver candidate and pattern limits must be non-negative")
+    if not 0.0 <= args.solver_fast_capacity_tolerance <= 1.0:
+        raise ValueError("--solver-fast-capacity-tolerance must be in [0, 1]")
     if args.solver_min_quota <= 0:
         raise ValueError("--solver-min-quota must be positive")
     if args.solver_ultraep_beta < 1.0:
         raise ValueError("--solver-ultraep-beta must be at least 1")
-    if args.solver_time_limit <= 0:
-        raise ValueError("--solver-time-limit must be positive")
-    if not 0.0 <= args.solver_mip_gap < 1.0:
-        raise ValueError("--solver-mip-gap must be in [0, 1)")
     weights = (
         args.solver_compute_weight,
         args.solver_communication_weight,
@@ -1531,17 +1189,12 @@ def run_solver_only(args: argparse.Namespace) -> None:
     groups, home_by_expert, trace = _load_solver_trace(args)
     world_size = trace["world_size"]
     num_experts = trace["num_experts"]
-    search = _make_solver_search_space(
-        groups,
-        home_by_expert,
-        world_size,
-        args,
-    )
     baseline_allocations = _baseline_solver_allocations(
         groups,
         home_by_expert,
         world_size,
     )
+    ultraep_started = time.perf_counter()
     ultraep_allocations, ultraep_placements, ultraep_threshold = (
         _ultraep_solver_allocations(
             groups,
@@ -1552,11 +1205,18 @@ def run_solver_only(args: argparse.Namespace) -> None:
             args.solver_min_quota,
         )
     )
-    joint_allocations, joint_placements, joint_solver = _solve_joint_milp(
-        search,
+    ultraep_solve_ms = (time.perf_counter() - ultraep_started) * 1e3
+    joint_started = time.perf_counter()
+    joint_allocations, joint_placements, joint_threshold = _ultraep_solver_allocations(
+        groups,
+        home_by_expert,
         world_size,
+        args.solver_redundant_slots,
+        args.solver_ultraep_beta,
+        args.solver_min_quota,
         args,
     )
+    joint_solve_ms = (time.perf_counter() - joint_started) * 1e3
     plans = [
         _solver_plan_payload(
             "original",
@@ -1581,31 +1241,31 @@ def run_solver_only(args: argparse.Namespace) -> None:
                 "algorithm": "UltraEP Algorithm 1 quota threshold and locality",
                 "compute_threshold": ultraep_threshold,
                 "beta": args.solver_ultraep_beta,
+                "solve_ms": ultraep_solve_ms,
             },
         ),
         _solver_plan_payload(
-            "joint_milp",
+            "joint_fast",
             joint_allocations,
             joint_placements,
             home_by_expert,
             num_experts,
             world_size,
             args,
-            joint_solver,
+            {
+                "status": "heuristic",
+                "algorithm": (
+                    "UltraEP quota threshold with communication-aware "
+                    "replica target selection"
+                ),
+                "compute_threshold": joint_threshold,
+                "beta": args.solver_ultraep_beta,
+                "capacity_tolerance": args.solver_fast_capacity_tolerance,
+                "solve_ms": joint_solve_ms,
+            },
         ),
     ]
     joint_plan = plans[-1]
-    if not math.isclose(
-        joint_plan["metrics"]["objective"],
-        joint_solver["milp_objective"],
-        rel_tol=1e-7,
-        abs_tol=1e-7,
-    ):
-        raise RuntimeError(
-            "MILP objective does not match the reconstructed token route: "
-            f"solver={joint_solver['milp_objective']}, "
-            f"route={joint_plan['metrics']['objective']}"
-        )
     ultraep_metrics = plans[1]["metrics"]
     joint_metrics = joint_plan["metrics"]
     payload = {
@@ -1625,7 +1285,7 @@ def run_solver_only(args: argparse.Namespace) -> None:
             "replica_weight": args.solver_replica_weight,
             "warning": (
                 "This is a load proxy. Calibrate the weights with real kernel "
-                "measurements before interpreting its optimum as minimum latency."
+                "measurements before interpreting its score as minimum latency."
             ),
         },
         "redundant_slots_per_rank": args.solver_redundant_slots,
@@ -1644,8 +1304,12 @@ def run_solver_only(args: argparse.Namespace) -> None:
                 "Count-only traces reconstruct top-k rows and therefore cannot "
                 "preserve original expert co-occurrence."
             ),
+            (
+                "The communication-aware plan is a fast heuristic and does not "
+                "provide a global-optimality guarantee."
+            ),
         ],
-        "joint_vs_ultraep": {
+        "joint_fast_vs_ultraep": {
             "objective_delta": (
                 joint_metrics["objective"] - ultraep_metrics["objective"]
             ),
