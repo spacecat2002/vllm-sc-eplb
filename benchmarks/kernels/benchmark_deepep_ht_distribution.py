@@ -11,6 +11,23 @@ dispatch, expert compute, and combine are the real DeepEP/MoE callbacks::
         --local-shares 0.9,0.1 \
         --no-detail-profile --output-jsonl /tmp/deepep_ht_compare.jsonl
 
+Run the controlled compute-uniformity by communication-uniformity experiment::
+
+    .venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=4 \
+        benchmarks/kernels/benchmark_deepep_ht_distribution.py \
+        --benchmarks joint --joint-route-shares L1F0:0.1,L1F1:0.4,L0F2:0.5 \
+        --num-experts 128 --top-k 8 --no-detail-profile
+
+This produces four routes: balanced/balanced, skewed/balanced,
+balanced/hotspot, and skewed/hotspot. The same physical top-k IDs determine
+both the expert-token load and the unique source-to-destination token transfers.
+All routes use the same local-presence/remote-fan-out state distribution,
+keeping remote transfer volume fixed while uniformity changes. ``L1F2`` means
+the token uses local experts and two remote ranks; ``L0F2`` is remote-only.
+If every remote token has full fan-out, communication is saturated and the two
+hotspot routes are omitted because they would be identical to the balanced
+routes.
+
 The ``compute_ms`` column is the maximum expert-kernel time across ranks, and
 ``communication_ms`` is the maximum dispatch-plus-combine time across ranks.
 ``planned_load_max_over_mean`` reports the generated expert-assignment skew.
@@ -114,18 +131,30 @@ COMMUNICATION_PATTERNS = (
 @dataclass(frozen=True)
 class LoadCase:
     name: str
-    kind: Literal["compute", "communication"]
+    kind: Literal["compute", "communication", "joint"]
     pattern: str
     variant: str
     control_value: float
     source_target_weights: tuple[tuple[float, ...], ...]
     source_local_token_shares: tuple[float, ...] | None = None
+    compute_pattern: str | None = None
+    communication_pattern: str | None = None
+    joint_route_shares: tuple[tuple[int, int, float], ...] | None = None
+    hot_rank: int = 0
     seed: int | None = None
     planned_source_target_shares: tuple[tuple[float, ...], ...] = ()
     planned_target_assignments: tuple[int, ...] = ()
     planned_target_shares: tuple[float, ...] = ()
     planned_expert_assignments_by_rank: tuple[tuple[int, ...], ...] = ()
     planned_load_max_over_mean: float = 0.0
+    planned_expert_load_max_over_mean: float = 0.0
+    planned_destination_comm_max_over_mean: float = 0.0
+    planned_link_comm_max_over_mean: float = 0.0
+    planned_remote_transfer_matrix: tuple[tuple[int, ...], ...] = ()
+    planned_fanout_counts: tuple[int, ...] = ()
+    planned_fanout_shares: tuple[float, ...] = ()
+    planned_route_state_counts: tuple[tuple[int, ...], ...] = ()
+    planned_route_state_shares: tuple[tuple[float, ...], ...] = ()
     planned_local_share_min: float = 0.0
     planned_local_share_max: float = 0.0
     planned_remote_fanout: float = 0.0
@@ -140,6 +169,8 @@ class RoutingStats:
     fully_local_tokens: int
     remote_tokens: int
     remote_token_transfers: int
+    fanout_counts: list[int]
+    route_state_counts: list[list[int]]
 
 
 def apply_model_config(args: argparse.Namespace) -> argparse.Namespace:
@@ -193,9 +224,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--benchmarks",
         nargs="+",
-        choices=("compute", "communication"),
+        choices=("compute", "communication", "joint"),
         default=["compute", "communication"],
-        help="Token-load dimensions to measure.",
+        help=(
+            "Token-load dimensions to measure. joint runs the controlled 2x2 "
+            "compute-uniformity by communication-uniformity experiment."
+        ),
     )
     parser.add_argument(
         "--compute-patterns",
@@ -231,6 +265,17 @@ def parse_args() -> argparse.Namespace:
             "Comma-separated fractions of tokens whose complete top-k stays on "
             "the source rank. Include values above and below 0.5 to compare "
             "mostly-local and mostly-remote communication."
+        ),
+    )
+    parser.add_argument(
+        "--joint-route-shares",
+        action="append",
+        metavar="LxFy:SHARE,...",
+        help=(
+            "Local-presence/remote-fan-out distribution for --benchmarks joint, "
+            "for example L1F0:0.1,L1F1:0.4,L0F2:0.5. L1 includes the source "
+            "rank, L0 is remote-only, and F is the number of remote ranks. "
+            "Shares must sum to one. Repeat to benchmark multiple distributions."
         ),
     )
     parser.add_argument("--warmup", type=int, default=10)
@@ -288,6 +333,46 @@ def parse_shares(raw: str, option: str) -> list[float]:
     if any(not 0.0 <= value <= 1.0 for value in values):
         raise ValueError(f"{option} values must be in [0, 1]")
     return values
+
+
+def parse_route_shares(
+    raw: str,
+    world_size: int,
+) -> tuple[tuple[int, int, float], ...]:
+    shares: dict[tuple[int, int], float] = {}
+    seen = set()
+    for entry in raw.split(","):
+        parts = entry.strip().split(":")
+        if len(parts) != 2:
+            raise ValueError("--joint-route-shares entries must use LxFy:SHARE syntax")
+        state = parts[0].upper()
+        if len(state) < 4 or state[0] != "L" or "F" not in state:
+            raise ValueError("--joint-route-shares state must use LxFy syntax")
+        local_raw, fanout_raw = state[1:].split("F", maxsplit=1)
+        if local_raw not in ("0", "1") or not fanout_raw.isdigit():
+            raise ValueError("--joint-route-shares state must use LxFy syntax")
+        local_present = int(local_raw)
+        fanout = int(fanout_raw)
+        share = float(parts[1])
+        if not 0 <= fanout < world_size:
+            raise ValueError(
+                "--joint-route-shares fan-out must be between 0 and WORLD_SIZE - 1"
+            )
+        if local_present == 0 and fanout == 0:
+            raise ValueError("L0F0 is invalid because it selects no expert rank")
+        route_state = (local_present, fanout)
+        if route_state in seen:
+            raise ValueError(f"--joint-route-shares contains {state} more than once")
+        if not 0.0 <= share <= 1.0:
+            raise ValueError("--joint-route-shares shares must be in [0, 1]")
+        seen.add(route_state)
+        shares[route_state] = share
+    if not seen or not math.isclose(sum(shares.values()), 1.0, abs_tol=1e-9):
+        raise ValueError("--joint-route-shares shares must sum to 1")
+    return tuple(
+        (local_present, fanout, shares[local_present, fanout])
+        for local_present, fanout in sorted(shares)
+    )
 
 
 def parse_token_counts(raw: str | None, fallback: int, world_size: int) -> list[int]:
@@ -586,6 +671,223 @@ def _make_communication_topk_ids(
     return torch.tensor(rows, dtype=torch.int64)
 
 
+def _joint_target_counts(
+    *,
+    case: LoadCase,
+    source_rank: int,
+    global_token: int,
+    local_present: bool,
+    fanout: int,
+    top_k: int,
+    world_size: int,
+    experts_per_rank: int,
+) -> list[int]:
+    compute_pattern = case.compute_pattern
+    communication_pattern = case.communication_pattern
+    if compute_pattern not in ("balanced", "skewed"):
+        raise ValueError(f"Unknown joint compute pattern: {compute_pattern}")
+    if communication_pattern not in ("balanced", "hotspot", "saturated"):
+        raise ValueError(
+            f"Unknown joint communication pattern: {communication_pattern}"
+        )
+
+    hot_rank = case.hot_rank % world_size
+    remote_ranks = [rank for rank in range(world_size) if rank != source_rank]
+    if not 1 <= fanout <= world_size - 1:
+        raise ValueError("fan-out must be between 1 and WORLD_SIZE - 1")
+
+    def rotate_targets(ranks: list[int], count: int) -> list[int]:
+        start = global_token % len(ranks)
+        return [ranks[(start + offset) % len(ranks)] for offset in range(count)]
+
+    if communication_pattern in ("balanced", "saturated"):
+        remote_targets = rotate_targets(remote_ranks, fanout)
+    elif source_rank != hot_rank:
+        cold_ranks = [rank for rank in remote_ranks if rank != hot_rank]
+        remote_targets = [hot_rank, *rotate_targets(cold_ranks, fanout - 1)]
+    else:
+        cold_ranks = remote_ranks
+        remote_targets = rotate_targets(cold_ranks, fanout)
+    targets = [*([source_rank] if local_present else []), *remote_targets]
+
+    def distribute(total: int, ranks: list[int]) -> list[int]:
+        counts = [0] * world_size
+        base, remainder = divmod(total, len(ranks))
+        for offset, rank in enumerate(ranks):
+            counts[rank] = base + (offset < remainder)
+        return counts
+
+    counts = [0] * world_size
+    if (
+        compute_pattern == "balanced"
+        and local_present
+        and communication_pattern
+        in (
+            "balanced",
+            "saturated",
+        )
+    ):
+        counts[source_rank] = top_k - fanout
+        for rank in remote_targets:
+            counts[rank] += 1
+    elif compute_pattern == "balanced" and communication_pattern in (
+        "balanced",
+        "saturated",
+    ):
+        counts = distribute(top_k, remote_targets)
+    elif compute_pattern == "balanced" and local_present:
+        if source_rank == hot_rank:
+            counts[hot_rank] = top_k - (world_size - 1)
+            remote_counts = distribute(world_size - 1, remote_targets)
+            for rank, count in enumerate(remote_counts):
+                counts[rank] += count
+        else:
+            counts[source_rank] = top_k - fanout
+            for rank in remote_targets:
+                counts[rank] += 1
+    elif compute_pattern == "balanced":
+        if source_rank == hot_rank:
+            counts = distribute(top_k, remote_targets)
+        else:
+            hot_slots = top_k // (world_size - 1)
+            if global_token % (world_size - 1) < top_k % (world_size - 1):
+                hot_slots += 1
+            counts[hot_rank] = hot_slots
+            other_targets = [rank for rank in remote_targets if rank != hot_rank]
+            distributed = distribute(top_k - hot_slots, other_targets)
+            for rank, count in enumerate(distributed):
+                counts[rank] += count
+    else:
+        requested_hot_slots = max(
+            top_k // 2 + 1,
+            round(top_k * case.control_value),
+        )
+        other_target_count = len(targets) - int(hot_rank in targets)
+        requested_hot_slots = min(
+            requested_hot_slots,
+            top_k - other_target_count,
+        )
+        if communication_pattern in ("balanced", "saturated"):
+            if hot_rank in targets:
+                counts[hot_rank] = requested_hot_slots
+                other_targets = [rank for rank in targets if rank != hot_rank]
+                distributed = distribute(top_k - requested_hot_slots, other_targets)
+                for rank, count in enumerate(distributed):
+                    counts[rank] += count
+            else:
+                counts = distribute(top_k, targets)
+        elif local_present:
+            numerator = (fanout + 1) * requested_hot_slots
+            hot_slots = numerator // world_size
+            if global_token % world_size < numerator % world_size:
+                hot_slots += 1
+            counts[hot_rank] = hot_slots
+            other_targets = [rank for rank in targets if rank != hot_rank]
+            distributed = distribute(top_k - hot_slots, other_targets)
+            for rank, count in enumerate(distributed):
+                counts[rank] += count
+        elif source_rank == hot_rank:
+            counts = distribute(top_k, remote_targets)
+        else:
+            numerator = fanout * requested_hot_slots
+            hot_slots = numerator // (world_size - 1)
+            if global_token % (world_size - 1) < numerator % (world_size - 1):
+                hot_slots += 1
+            counts[hot_rank] = hot_slots
+            other_targets = [rank for rank in remote_targets if rank != hot_rank]
+            distributed = distribute(top_k - hot_slots, other_targets)
+            for rank, count in enumerate(distributed):
+                counts[rank] += count
+
+    if any(counts[rank] <= 0 for rank in targets):
+        raise RuntimeError(
+            f"joint route dropped a selected destination: targets={targets}, "
+            f"counts={counts}"
+        )
+    if max(counts) > experts_per_rank:
+        raise ValueError(
+            "joint cases require every token's per-rank top-k count to fit the "
+            f"physical experts; counts={counts}, experts_per_rank={experts_per_rank}"
+        )
+    return counts
+
+
+def _make_joint_topk_ids(
+    *,
+    case: LoadCase,
+    tokens: int,
+    top_k: int,
+    num_experts: int,
+    source_rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    experts_per_rank = num_experts // world_size
+    if case.joint_route_shares is None:
+        raise ValueError("joint case is missing its route-state distribution")
+    route_counts = apportion(
+        tokens,
+        [share for _, _, share in case.joint_route_shares],
+        0,
+    )
+    has_fully_local_tokens = any(
+        local_present and fanout == 0 and count
+        for (local_present, fanout, _), count in zip(
+            case.joint_route_shares,
+            route_counts,
+        )
+    )
+    if has_fully_local_tokens and top_k > experts_per_rank:
+        raise ValueError(
+            "joint fully-local tokens require top_k <= experts_per_rank; "
+            f"got top_k={top_k}, experts_per_rank={experts_per_rank}"
+        )
+    rng = random.Random((case.seed or 0) + source_rank * 104729)
+    token_states = [
+        (local_present, fanout, state_index)
+        for state_index, ((local_present, fanout, _), count) in enumerate(
+            zip(case.joint_route_shares, route_counts)
+        )
+        for _ in range(count)
+    ]
+    rng.shuffle(token_states)
+    seen_per_state = [0] * len(case.joint_route_shares)
+    seen_per_rank = [0] * world_size
+    rows = []
+    for local_present, fanout, state_index in token_states:
+        if fanout == 0:
+            if not local_present:
+                raise RuntimeError("L0F0 cannot produce a top-k route")
+            targets = [source_rank] * top_k
+        else:
+            global_token = (
+                source_rank * route_counts[state_index] + seen_per_state[state_index]
+            )
+            seen_per_state[state_index] += 1
+            counts = _joint_target_counts(
+                case=case,
+                source_rank=source_rank,
+                global_token=global_token,
+                local_present=bool(local_present),
+                fanout=fanout,
+                top_k=top_k,
+                world_size=world_size,
+                experts_per_rank=experts_per_rank,
+            )
+            targets = [rank for rank, count in enumerate(counts) for _ in range(count)]
+        row = []
+        rank_occurrences: dict[int, int] = defaultdict(int)
+        for target in targets:
+            local_expert = (
+                seen_per_rank[target] + rank_occurrences[target]
+            ) % experts_per_rank
+            row.append(target * experts_per_rank + local_expert)
+            rank_occurrences[target] += 1
+        for target, occurrences in rank_occurrences.items():
+            seen_per_rank[target] += occurrences
+        rows.append(row)
+    return torch.tensor(rows, dtype=torch.int64)
+
+
 def make_case_topk_ids(
     case: LoadCase,
     *,
@@ -605,8 +907,17 @@ def make_case_topk_ids(
             world_size=world_size,
             target_weights=case.source_target_weights[source_rank],
         )
-    else:
+    elif case.kind == "communication":
         topk_ids = _make_communication_topk_ids(
+            case=case,
+            tokens=tokens,
+            top_k=top_k,
+            num_experts=num_experts,
+            source_rank=source_rank,
+            world_size=world_size,
+        )
+    else:
+        topk_ids = _make_joint_topk_ids(
             case=case,
             tokens=tokens,
             top_k=top_k,
@@ -642,6 +953,29 @@ def routing_stats(
         int(torch.any(target_ranks == rank, dim=1).sum().item())
         for rank in range(world_size)
     ]
+    remote_presence = torch.stack(
+        [
+            torch.any(target_ranks == rank, dim=1)
+            for rank in range(world_size)
+            if rank != source_rank
+        ],
+        dim=1,
+    )
+    token_fanouts = remote_presence.sum(dim=1).to(torch.int64)
+    fanout_counts = torch.bincount(
+        token_fanouts,
+        minlength=world_size,
+    ).tolist()
+    local_presence = torch.any(target_ranks == source_rank, dim=1).to(torch.int64)
+    route_state_counts = [[0] * world_size for _ in range(2)]
+    for local_present in range(2):
+        state_mask = local_presence == local_present
+        state_fanouts = token_fanouts[state_mask]
+        state_counts = torch.bincount(
+            state_fanouts,
+            minlength=world_size,
+        ).tolist()
+        route_state_counts[local_present] = [int(value) for value in state_counts]
     local_mask = torch.all(target_ranks == source_rank, dim=1)
     remote_mask = ~local_mask
     remote_transfers = sum(unique_tokens) - unique_tokens[source_rank]
@@ -652,6 +986,8 @@ def routing_stats(
         fully_local_tokens=int(local_mask.sum().item()),
         remote_tokens=int(remote_mask.sum().item()),
         remote_token_transfers=remote_transfers,
+        fanout_counts=[int(value) for value in fanout_counts],
+        route_state_counts=route_state_counts,
     )
 
 
@@ -769,6 +1105,9 @@ def _finalize_load_case(
     target_assignments = [0] * world_size
     expert_assignments = [0] * num_experts
     actual_weight_rows = []
+    remote_transfer_matrix = [[0] * world_size for _ in range(world_size)]
+    fanout_counts = [0] * world_size
+    route_state_counts = [[0] * world_size for _ in range(2)]
     local_shares = []
     remote_tokens = 0
     remote_transfers = 0
@@ -812,8 +1151,16 @@ def _finalize_load_case(
             tuple(count / (tokens * top_k) for count in stats.target_assignments)
         )
         local_shares.append(stats.fully_local_tokens / tokens)
+        for target_rank, unique_tokens in enumerate(stats.target_unique_tokens):
+            if target_rank != source_rank:
+                remote_transfer_matrix[source_rank][target_rank] = unique_tokens
         remote_tokens += stats.remote_tokens
         remote_transfers += stats.remote_token_transfers
+        for fanout, count in enumerate(stats.fanout_counts):
+            fanout_counts[fanout] += count
+        for local_present, state_counts in enumerate(stats.route_state_counts):
+            for fanout, count in enumerate(state_counts):
+                route_state_counts[local_present][fanout] += count
         target_ranks = torch.div(
             topk_ids,
             experts_per_rank,
@@ -834,22 +1181,86 @@ def _finalize_load_case(
     target_shares = tuple(count / total_assignments for count in target_assignments)
     mean_load = statistics.mean(target_assignments)
     load_ratio = max(target_assignments) / mean_load
-    if case.variant == "balanced":
-        if max(target_assignments) - min(target_assignments) > world_size:
+    expert_mean = statistics.mean(expert_assignments)
+    expert_load_ratio = max(expert_assignments) / expert_mean
+    incoming_remote = [
+        sum(remote_transfer_matrix[source][target] for source in range(world_size))
+        for target in range(world_size)
+    ]
+    incoming_mean = statistics.mean(incoming_remote)
+    destination_comm_ratio = (
+        max(incoming_remote) / incoming_mean if incoming_mean else 0.0
+    )
+    link_loads = [
+        remote_transfer_matrix[source][target]
+        for source in range(world_size)
+        for target in range(world_size)
+        if source != target
+    ]
+    link_mean = statistics.mean(link_loads)
+    link_comm_ratio = max(link_loads) / link_mean if link_mean else 0.0
+
+    compute_is_balanced = (
+        case.variant == "balanced" or case.compute_pattern == "balanced"
+    )
+    compute_is_skewed = (
+        case.kind == "compute" and case.variant != "balanced"
+    ) or case.compute_pattern == "skewed"
+    if compute_is_balanced:
+        if load_ratio > 1.01:
             raise ValueError(
-                f"{case.name} is not balanced after rounding: {target_assignments}"
+                f"{case.name} is not balanced after rounding: "
+                f"max/mean={load_ratio:.4f}, loads={target_assignments}"
             )
-    elif case.kind == "compute" and load_ratio < 1.05:
+        if expert_load_ratio > 1.05:
+            raise ValueError(
+                f"{case.name} has imbalanced physical experts: "
+                f"max/mean={expert_load_ratio:.4f}"
+            )
+    elif compute_is_skewed and load_ratio < 1.05:
         raise ValueError(
             f"{case.name} is not measurably skewed: max/mean={load_ratio:.4f}. "
             "Reduce --top-k or increase the requested skew."
         )
 
+    remote_fanout = remote_transfers / remote_tokens if remote_tokens else 0.0
+    if case.kind == "joint" and remote_transfers:
+        assert case.joint_route_shares is not None
+        expected_route_state_counts = [[0] * world_size for _ in range(2)]
+        for tokens in token_counts:
+            source_counts = apportion(
+                tokens,
+                [share for _, _, share in case.joint_route_shares],
+                0,
+            )
+            for (local_present, fanout, _), count in zip(
+                case.joint_route_shares,
+                source_counts,
+            ):
+                expected_route_state_counts[local_present][fanout] += count
+        if route_state_counts != expected_route_state_counts:
+            raise ValueError(
+                f"{case.name} changed the token route-state histogram: expected "
+                f"{expected_route_state_counts}, got {route_state_counts}"
+            )
+        if case.communication_pattern in ("balanced", "saturated"):
+            if destination_comm_ratio > 1.01 or link_comm_ratio > 1.01:
+                raise ValueError(
+                    f"{case.name} did not balance communication: destination "
+                    f"max/mean={destination_comm_ratio:.4f}, link "
+                    f"max/mean={link_comm_ratio:.4f}"
+                )
+        elif destination_comm_ratio < 1.05 or link_comm_ratio < 1.05:
+            raise ValueError(
+                f"{case.name} did not create a communication hotspot: destination "
+                f"max/mean={destination_comm_ratio:.4f}, link "
+                f"max/mean={link_comm_ratio:.4f}"
+            )
+
     if case.variant == "mostly_local" and any(share <= 0.5 for share in local_shares):
         raise ValueError(f"{case.name} did not keep a majority local on every rank")
     if case.variant == "mostly_remote" and any(share >= 0.5 for share in local_shares):
         raise ValueError(f"{case.name} did not make a majority remote on every rank")
-    remote_fanout = remote_transfers / remote_tokens if remote_tokens else 0.0
     if (
         case.kind == "communication"
         and case.pattern == "spread"
@@ -873,6 +1284,21 @@ def _finalize_load_case(
             for rank in range(world_size)
         ),
         planned_load_max_over_mean=load_ratio,
+        planned_expert_load_max_over_mean=expert_load_ratio,
+        planned_destination_comm_max_over_mean=destination_comm_ratio,
+        planned_link_comm_max_over_mean=link_comm_ratio,
+        planned_remote_transfer_matrix=tuple(
+            tuple(row) for row in remote_transfer_matrix
+        ),
+        planned_fanout_counts=tuple(fanout_counts),
+        planned_fanout_shares=tuple(
+            count / sum(fanout_counts) for count in fanout_counts
+        ),
+        planned_route_state_counts=tuple(tuple(row) for row in route_state_counts),
+        planned_route_state_shares=tuple(
+            tuple(count / sum(fanout_counts) for count in row)
+            for row in route_state_counts
+        ),
         planned_local_share_min=min(local_shares),
         planned_local_share_max=max(local_shares),
         planned_remote_fanout=remote_fanout,
@@ -975,6 +1401,113 @@ def build_load_cases(
                     )
                 )
 
+    if "joint" in args.benchmarks:
+        if len(set(token_counts)) != 1:
+            raise ValueError(
+                "The controlled joint experiment requires equal token counts "
+                "per rank; run unequal token counts as a separate stress case."
+            )
+        if args.top_k < world_size:
+            raise ValueError(
+                "The controlled joint experiment requires top_k >= WORLD_SIZE "
+                "so expert slots can be redistributed while remote fan-out stays fixed."
+            )
+        if args.joint_route_shares is None:
+            raise ValueError(
+                "--benchmarks joint requires at least one "
+                "--joint-route-shares distribution"
+            )
+        route_distributions = [
+            parse_route_shares(raw, world_size) for raw in args.joint_route_shares
+        ]
+        experts_per_rank = args.num_experts // world_size
+        for route_shares in route_distributions:
+            active_states = [
+                (local_present, fanout)
+                for local_present, fanout, share in route_shares
+                if share > 0
+            ]
+            remote_fanouts = [fanout for _, fanout in active_states if fanout > 0]
+            if not remote_fanouts:
+                raise ValueError(
+                    "--joint-route-shares must assign a positive share to at "
+                    "least one remote fan-out"
+                )
+            saturated_communication = all(
+                fanout == world_size - 1 for fanout in remote_fanouts
+            )
+            if not saturated_communication and (0, 1) in active_states:
+                raise ValueError(
+                    "L0F1 is structurally incompatible with the controlled "
+                    "compute-balanced communication-hotspot case: a remote-only "
+                    "token with one destination has no alternative rank for its "
+                    "top-k slots. Use L0F2 or larger for the full 2x2 experiment."
+                )
+            max_slots_on_one_rank = max(
+                args.top_k
+                if local_present and fanout == 0
+                else args.top_k - fanout
+                if local_present
+                else args.top_k - (fanout - 1)
+                for local_present, fanout in active_states
+            )
+            if max_slots_on_one_rank > experts_per_rank:
+                raise ValueError(
+                    "The controlled joint experiment requires every token's "
+                    "per-rank top-k count to fit the physical experts; "
+                    f"required={max_slots_on_one_rank}, "
+                    f"experts_per_rank={experts_per_rank}."
+                )
+            route_label = "_".join(
+                f"L{local_present}F{fanout}-{share:g}"
+                for local_present, fanout, share in route_shares
+                if share > 0
+            )
+            for compute_pattern in ("balanced", "skewed"):
+                communication_patterns = (
+                    ("saturated",)
+                    if saturated_communication
+                    else ("balanced", "hotspot")
+                )
+                for communication_pattern in communication_patterns:
+                    compute_weights = _compute_weight_matrix(
+                        "balanced" if compute_pattern == "balanced" else "single_hot",
+                        world_size,
+                        args.hot_rank,
+                        (
+                            1.0 / world_size
+                            if compute_pattern == "balanced"
+                            else args.imbalance_strength
+                        ),
+                        args.zipf_alpha,
+                        args.seed,
+                    )
+                    candidates.append(
+                        LoadCase(
+                            name=(
+                                f"joint_compute_{compute_pattern}_comm_"
+                                f"{communication_pattern}_routes_{route_label}"
+                            ),
+                            kind="joint",
+                            pattern=f"{compute_pattern}_{communication_pattern}",
+                            variant=(
+                                f"compute_{compute_pattern}_"
+                                f"communication_{communication_pattern}"
+                            ),
+                            control_value=(
+                                args.imbalance_strength
+                                if compute_pattern == "skewed"
+                                else 1.0 / world_size
+                            ),
+                            source_target_weights=compute_weights,
+                            compute_pattern=compute_pattern,
+                            communication_pattern=communication_pattern,
+                            joint_route_shares=route_shares,
+                            hot_rank=args.hot_rank,
+                            seed=args.seed,
+                        )
+                    )
+
     if "communication" in args.benchmarks:
         for local_share in parse_shares(args.local_shares, "--local-shares"):
             variant = (
@@ -1023,6 +1556,51 @@ def build_load_cases(
             continue
         fingerprints.add(dedupe_key)
         cases.append(case)
+
+    joint_by_route: dict[tuple[tuple[int, int, float], ...], list[LoadCase]] = (
+        defaultdict(list)
+    )
+    for case in cases:
+        if case.kind == "joint":
+            assert case.joint_route_shares is not None
+            joint_by_route[case.joint_route_shares].append(case)
+    for route_cases in joint_by_route.values():
+        transfer_totals = {
+            sum(sum(row) for row in case.planned_remote_transfer_matrix)
+            for case in route_cases
+        }
+        route_histograms = {case.planned_route_state_counts for case in route_cases}
+        if len(transfer_totals) != 1 or len(route_histograms) != 1:
+            raise RuntimeError(
+                "Joint cases changed communication volume while varying "
+                "uniformity: "
+                f"transfers={sorted(transfer_totals)}, "
+                f"route_histograms={sorted(route_histograms)}"
+            )
+        expected_communication_cases = (
+            1
+            if all(
+                fanout in (0, world_size - 1)
+                for fanout, count in enumerate(route_cases[0].planned_fanout_counts)
+                if count
+            )
+            else 2
+        )
+        for compute_pattern in ("balanced", "skewed"):
+            load_ratios = [
+                case.planned_load_max_over_mean
+                for case in route_cases
+                if case.compute_pattern == compute_pattern
+            ]
+            ratios_differ = len(load_ratios) == 2 and not math.isclose(
+                load_ratios[0], load_ratios[1], rel_tol=0.01, abs_tol=0.01
+            )
+            if len(load_ratios) != expected_communication_cases or ratios_differ:
+                raise RuntimeError(
+                    "Joint cases changed compute skew while varying communication "
+                    f"uniformity: compute_pattern={compute_pattern}, "
+                    f"max_over_mean={load_ratios}"
+                )
     if not cases:
         raise ValueError(
             "The selected load patterns did not produce any distinct cases"
@@ -1038,6 +1616,13 @@ def load_case_metadata(case: LoadCase | None) -> dict[str, Any]:
         "benchmark_kind": case.kind,
         "pattern": case.pattern,
         "variant": case.variant,
+        "compute_pattern": case.compute_pattern,
+        "communication_pattern": case.communication_pattern,
+        "joint_route_shares": (
+            [list(state) for state in case.joint_route_shares]
+            if case.joint_route_shares is not None
+            else None
+        ),
         "control_value": case.control_value,
         "scenario_seed": case.seed,
         "planned_source_target_shares": [
@@ -1049,6 +1634,22 @@ def load_case_metadata(case: LoadCase | None) -> dict[str, Any]:
             list(row) for row in case.planned_expert_assignments_by_rank
         ],
         "planned_load_max_over_mean": case.planned_load_max_over_mean,
+        "planned_expert_load_max_over_mean": (case.planned_expert_load_max_over_mean),
+        "planned_destination_comm_max_over_mean": (
+            case.planned_destination_comm_max_over_mean
+        ),
+        "planned_link_comm_max_over_mean": case.planned_link_comm_max_over_mean,
+        "planned_remote_transfer_matrix": [
+            list(row) for row in case.planned_remote_transfer_matrix
+        ],
+        "planned_fanout_counts": list(case.planned_fanout_counts),
+        "planned_fanout_shares": list(case.planned_fanout_shares),
+        "planned_route_state_counts": [
+            list(row) for row in case.planned_route_state_counts
+        ],
+        "planned_route_state_shares": [
+            list(row) for row in case.planned_route_state_shares
+        ],
         "planned_local_share_min": case.planned_local_share_min,
         "planned_local_share_max": case.planned_local_share_max,
         "planned_remote_fanout": case.planned_remote_fanout,
@@ -1355,6 +1956,8 @@ def run_one_iter(
         "remote_tokens": route.remote_tokens,
         "remote_unique_tokens": route.remote_token_transfers,
         "remote_token_transfers": route.remote_token_transfers,
+        "source_fanout_counts": route.fanout_counts,
+        "source_route_state_counts": route.route_state_counts,
         "source_tokens": args.tokens,
         "local_path_tokens": 0,
         "deepep_source_tokens": args.tokens,
@@ -1594,6 +2197,8 @@ def run_local_bypass_iter(
         "remote_tokens": route.remote_tokens,
         "remote_unique_tokens": route.remote_token_transfers,
         "remote_token_transfers": route.remote_token_transfers,
+        "source_fanout_counts": route.fanout_counts,
+        "source_route_state_counts": route.route_state_counts,
         "source_tokens": args.tokens,
         "local_path_tokens": local_path_tokens,
         "deepep_source_tokens": deepep_source_tokens,
@@ -1637,6 +2242,78 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         deepep_source_tokens = sum(row["deepep_source_tokens"] for row in rows)
         remote_payload_bytes = sum(row["remote_payload_bytes"] for row in rows)
         remote_unique_tokens = sum(row["remote_unique_tokens"] for row in rows)
+        actual_fanout_counts = [0] * len(rows)
+        actual_route_state_counts = [[0] * len(rows) for _ in range(2)]
+        for row in rows:
+            source_fanout_counts = row["source_fanout_counts"]
+            if len(source_fanout_counts) != len(rows):
+                raise RuntimeError(
+                    "Measured fan-out histogram has an invalid world size: "
+                    f"rank {row['rank']} reported {len(source_fanout_counts)} "
+                    f"buckets for {len(rows)} ranks"
+                )
+            for fanout, count in enumerate(source_fanout_counts):
+                actual_fanout_counts[fanout] += count
+            source_route_state_counts = row["source_route_state_counts"]
+            if len(source_route_state_counts) != 2 or any(
+                len(state_counts) != len(rows)
+                for state_counts in source_route_state_counts
+            ):
+                raise RuntimeError(
+                    "Measured route-state histogram has an invalid shape on "
+                    f"rank {row['rank']}: {source_route_state_counts}"
+                )
+            for local_present, state_counts in enumerate(source_route_state_counts):
+                for fanout, count in enumerate(state_counts):
+                    actual_route_state_counts[local_present][fanout] += count
+        actual_fanout_shares = [count / source_tokens for count in actual_fanout_counts]
+        actual_route_state_shares = [
+            [count / source_tokens for count in state_counts]
+            for state_counts in actual_route_state_counts
+        ]
+        actual_local_presence_share = sum(actual_route_state_counts[1]) / source_tokens
+        actual_mixed_local_remote_share = (
+            sum(actual_route_state_counts[1][1:]) / source_tokens
+        )
+        actual_remote_only_share = sum(actual_route_state_counts[0][1:]) / source_tokens
+        actual_experts_by_rank = {
+            int(row["rank"]): row["local_expert_tokens"] for row in rows
+        }
+        actual_experts = [actual_experts_by_rank[rank] for rank in range(len(rows))]
+        expert_loads = [count for rank_loads in actual_experts for count in rank_loads]
+        expert_mean = statistics.mean(expert_loads)
+        actual_expert_load_ratio = (
+            max(expert_loads) / expert_mean if expert_mean else 0.0
+        )
+        actual_transfer_matrix = [[0] * len(rows) for _ in rows]
+        for row in rows:
+            source_rank = int(row["rank"])
+            target_unique_tokens = row["source_target_unique_tokens"]
+            if len(target_unique_tokens) != len(rows):
+                raise RuntimeError(
+                    "Measured communication matrix has an invalid world size: "
+                    f"rank {source_rank} reported {len(target_unique_tokens)} "
+                    f"destinations for {len(rows)} ranks"
+                )
+            for target_rank, unique_tokens in enumerate(target_unique_tokens):
+                if source_rank != target_rank:
+                    actual_transfer_matrix[source_rank][target_rank] = unique_tokens
+        incoming_remote = [
+            sum(actual_transfer_matrix[source][target] for source in range(len(rows)))
+            for target in range(len(rows))
+        ]
+        incoming_mean = statistics.mean(incoming_remote)
+        actual_destination_comm_ratio = (
+            max(incoming_remote) / incoming_mean if incoming_mean else 0.0
+        )
+        link_loads = [
+            actual_transfer_matrix[source][target]
+            for source in range(len(rows))
+            for target in range(len(rows))
+            if source != target
+        ]
+        link_mean = statistics.mean(link_loads)
+        actual_link_comm_ratio = max(link_loads) / link_mean if link_mean else 0.0
         case_metadata = {
             field: rows[0][field]
             for field in LOAD_CASE_METADATA_FIELDS
@@ -1653,15 +2330,30 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     f"expected {planned_received}, got {actual_received}"
                 )
         planned_experts = rows[0].get("planned_expert_assignments_by_rank")
-        if planned_experts is not None:
-            actual_experts = [None] * len(rows)
-            for row in rows:
-                actual_experts[row["rank"]] = row["local_expert_tokens"]
-            if actual_experts != planned_experts:
-                raise RuntimeError(
-                    "Measured per-expert loads differ from the generated route: "
-                    f"expected {planned_experts}, got {actual_experts}"
-                )
+        if planned_experts is not None and actual_experts != planned_experts:
+            raise RuntimeError(
+                "Measured per-expert loads differ from the generated route: "
+                f"expected {planned_experts}, got {actual_experts}"
+            )
+        planned_transfers = rows[0].get("planned_remote_transfer_matrix")
+        if planned_transfers and actual_transfer_matrix != planned_transfers:
+            raise RuntimeError(
+                "Measured token-transfer loads differ from the generated route: "
+                f"expected {planned_transfers}, got {actual_transfer_matrix}"
+            )
+        planned_fanouts = rows[0].get("planned_fanout_counts")
+        if planned_fanouts and actual_fanout_counts != planned_fanouts:
+            raise RuntimeError(
+                "Measured token fan-out histogram differs from the generated "
+                f"route: expected {planned_fanouts}, got {actual_fanout_counts}"
+            )
+        planned_route_states = rows[0].get("planned_route_state_counts")
+        if planned_route_states and actual_route_state_counts != planned_route_states:
+            raise RuntimeError(
+                "Measured token route-state histogram differs from the generated "
+                f"route: expected {planned_route_states}, "
+                f"got {actual_route_state_counts}"
+            )
         dispatch_row = max(rows, key=lambda row: row["dispatch_ms"])
         compute_row = max(rows, key=lambda row: row["expert_compute_ms"])
         combine_row = max(rows, key=lambda row: row["combine_ms"])
@@ -1713,6 +2405,19 @@ def aggregate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "compute_load_max_over_mean": (
                     max(received) / received_mean if received_mean else 0.0
                 ),
+                "actual_expert_load_max_over_mean": actual_expert_load_ratio,
+                "actual_destination_comm_max_over_mean": (
+                    actual_destination_comm_ratio
+                ),
+                "actual_link_comm_max_over_mean": actual_link_comm_ratio,
+                "actual_remote_transfer_matrix": actual_transfer_matrix,
+                "actual_fanout_counts": actual_fanout_counts,
+                "actual_fanout_shares": actual_fanout_shares,
+                "actual_route_state_counts": actual_route_state_counts,
+                "actual_route_state_shares": actual_route_state_shares,
+                "actual_local_presence_share": actual_local_presence_share,
+                "actual_mixed_local_remote_share": (actual_mixed_local_remote_share),
+                "actual_remote_only_share": actual_remote_only_share,
                 "actual_local_share_min": min(actual_local_shares),
                 "actual_local_share_max": max(actual_local_shares),
                 "actual_local_share": fully_local_tokens / source_tokens,
@@ -1792,6 +2497,29 @@ def summarize(aggregates: list[dict[str, Any]], trim_ratio: float) -> dict[str, 
         "compute_load_max_over_mean": statistics.mean(
             row["compute_load_max_over_mean"] for row in kept
         ),
+        "actual_expert_load_max_over_mean": statistics.mean(
+            row["actual_expert_load_max_over_mean"] for row in kept
+        ),
+        "actual_destination_comm_max_over_mean": statistics.mean(
+            row["actual_destination_comm_max_over_mean"] for row in kept
+        ),
+        "actual_link_comm_max_over_mean": statistics.mean(
+            row["actual_link_comm_max_over_mean"] for row in kept
+        ),
+        "actual_remote_transfer_matrix": kept[0]["actual_remote_transfer_matrix"],
+        "actual_fanout_counts": kept[0]["actual_fanout_counts"],
+        "actual_fanout_shares": kept[0]["actual_fanout_shares"],
+        "actual_route_state_counts": kept[0]["actual_route_state_counts"],
+        "actual_route_state_shares": kept[0]["actual_route_state_shares"],
+        "actual_local_presence_share": statistics.mean(
+            row["actual_local_presence_share"] for row in kept
+        ),
+        "actual_mixed_local_remote_share": statistics.mean(
+            row["actual_mixed_local_remote_share"] for row in kept
+        ),
+        "actual_remote_only_share": statistics.mean(
+            row["actual_remote_only_share"] for row in kept
+        ),
         "actual_local_share_min": min(row["actual_local_share_min"] for row in kept),
         "actual_local_share_max": max(row["actual_local_share_max"] for row in kept),
         "actual_local_share": statistics.mean(
@@ -1833,11 +2561,23 @@ def summarize(aggregates: list[dict[str, Any]], trim_ratio: float) -> dict[str, 
 
 def print_summaries(summaries: list[dict[str, Any]]) -> None:
     print(
-        "execution_mode scenario variant actual_local remote_fanout dispatch_ms "
-        "compute_ms combine_ms communication_ms total_ms planned_load actual_load "
-        "recv_min recv_max remote_transfers remote_mib detail_samples"
+        "execution_mode scenario variant fully_local local_present local_remote "
+        "remote_only route_shares remote_fanout dispatch_ms compute_ms combine_ms "
+        "communication_ms total_ms planned_rank_load "
+        "actual_rank_load planned_expert_load actual_expert_load "
+        "planned_destination_comm actual_destination_comm planned_link_comm "
+        "actual_link_comm recv_min recv_max remote_transfers remote_mib "
+        "detail_samples"
     )
     for row in summaries:
+        route_shares = ",".join(
+            f"L{local_present}F{fanout}:{share:.3f}"
+            for local_present, state_shares in enumerate(
+                row["actual_route_state_shares"]
+            )
+            for fanout, share in enumerate(state_shares)
+            if share > 0
+        )
         sample_range = (
             f"{row['profile_sample_start']}:{row['profile_sample_end']}"
             if row["profile_sample_start"] is not None
@@ -1849,6 +2589,10 @@ def print_summaries(summaries: list[dict[str, Any]]) -> None:
             f"{row['variant']:>13} "
             f"{row['actual_local_share_min']:>5.3f}:"
             f"{row['actual_local_share_max']:<5.3f} "
+            f"{row['actual_local_presence_share']:>13.3f} "
+            f"{row['actual_mixed_local_remote_share']:>12.3f} "
+            f"{row['actual_remote_only_share']:>11.3f} "
+            f"{route_shares:>28} "
             f"{row['actual_remote_fanout']:>13.3f} "
             f"{row['dispatch_ms']:>11.3f} "
             f"{row['compute_ms']:>10.3f} "
@@ -1857,6 +2601,12 @@ def print_summaries(summaries: list[dict[str, Any]]) -> None:
             f"{row['total_ms']:>8.3f} "
             f"{row['planned_load_max_over_mean']:>12.3f} "
             f"{row['compute_load_max_over_mean']:>16.3f} "
+            f"{row['planned_expert_load_max_over_mean']:>19.3f} "
+            f"{row['actual_expert_load_max_over_mean']:>18.3f} "
+            f"{row['planned_destination_comm_max_over_mean']:>24.3f} "
+            f"{row['actual_destination_comm_max_over_mean']:>23.3f} "
+            f"{row['planned_link_comm_max_over_mean']:>17.3f} "
+            f"{row['actual_link_comm_max_over_mean']:>16.3f} "
             f"{row['received_tokens_min']:>8} "
             f"{row['received_tokens_max']:>8} "
             f"{row['remote_token_transfers']:>16.1f} "
@@ -1943,11 +2693,19 @@ def run_worker(
             print(
                 "load_case "
                 f"scenario={case.name} kind={case.kind} pattern={case.pattern} "
-                f"variant={case.variant} target_shares="
+                f"variant={case.variant} compute_pattern={case.compute_pattern} "
+                f"communication_pattern={case.communication_pattern} "
+                "target_shares="
                 f"{list(case.planned_target_shares)} "
                 f"local_share={case.planned_local_share_min:.3f}:"
                 f"{case.planned_local_share_max:.3f} "
+                f"route_state_shares={case.planned_route_state_shares} "
                 f"remote_fanout={case.planned_remote_fanout:.3f} "
+                f"rank_load={case.planned_load_max_over_mean:.3f} "
+                f"expert_load={case.planned_expert_load_max_over_mean:.3f} "
+                "destination_comm_load="
+                f"{case.planned_destination_comm_max_over_mean:.3f} "
+                f"link_comm_load={case.planned_link_comm_max_over_mean:.3f} "
                 f"fingerprint={case.routing_fingerprint}"
             )
 
@@ -2159,6 +2917,34 @@ def make_comparisons(summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "communication_ms",
                 )
             )
+
+    joint = [row for row in summaries if row.get("benchmark_kind") == "joint"]
+    by_route: dict[tuple[tuple[int, ...], ...], list[dict[str, Any]]] = defaultdict(
+        list
+    )
+    for row in joint:
+        route_counts = tuple(
+            tuple(state_counts) for state_counts in row["planned_route_state_counts"]
+        )
+        by_route[route_counts].append(row)
+    for rows in by_route.values():
+        baseline = next(
+            (
+                row
+                for row in rows
+                if row["compute_pattern"] == "balanced"
+                and row["communication_pattern"] in ("balanced", "saturated")
+            ),
+            None,
+        )
+        if baseline is None:
+            continue
+        for comparison in rows:
+            if comparison is baseline:
+                continue
+            comparisons.append(
+                _comparison_record("joint", baseline, comparison, "total_ms")
+            )
     return comparisons
 
 
@@ -2174,6 +2960,7 @@ def _comparison_record(
         "record_type": "comparison",
         "kind": kind,
         "pattern": comparison["pattern"],
+        "metric": metric,
         "baseline": baseline["scenario"],
         "baseline_control_value": baseline["control_value"],
         "baseline_ms": baseline_ms,
@@ -2187,14 +2974,14 @@ def _comparison_record(
 
 def print_comparisons(comparisons: list[dict[str, Any]]) -> None:
     print(
-        "comparison kind pattern baseline comparison baseline_ms comparison_ms "
-        "delta_ms ratio"
+        "comparison kind pattern metric baseline comparison baseline_ms "
+        "comparison_ms delta_ms ratio"
     )
     for row in comparisons:
         ratio = "undefined" if row["ratio"] is None else f"{row['ratio']:.3f}"
         print(
-            f"comparison {row['kind']} {row['pattern']} {row['baseline']} "
-            f"{row['comparison']} {row['baseline_ms']:.3f} "
+            f"comparison {row['kind']} {row['pattern']} {row['metric']} "
+            f"{row['baseline']} {row['comparison']} {row['baseline_ms']:.3f} "
             f"{row['comparison_ms']:.3f} {row['delta_ms']:.3f} {ratio}"
         )
 
