@@ -3,17 +3,22 @@
 """Collect and compare token-to-expert distributions from MoE traces.
 
 The collect command runs every dataset/batch-size combination in a fresh set
-of vLLM workers. The plot command can regenerate figures from existing traces.
-See ``moe_trace_expert_distribution.md`` for complete examples.
+of vLLM workers. The collect-solve command captures into temporary storage and
+keeps only the resulting placement and route plans. The plot command can
+regenerate figures from existing traces. See
+``moe_trace_expert_distribution.md`` for complete examples.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import multiprocessing as mp
 import os
 import re
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -242,6 +247,11 @@ def _rank_worker(
     activation_dir: Path,
     result_dir: Path,
 ) -> None:
+    trace_max_steps = getattr(
+        args,
+        "trace_max_steps",
+        len(prompts) * (args.max_model_len + args.max_new_tokens),
+    )
     os.environ.update(
         {
             "VLLM_DP_RANK": str(rank),
@@ -251,9 +261,7 @@ def _rank_worker(
             "VLLM_DP_MASTER_PORT": str(master_port),
             "VLLM_MOE_TRACE_DIR": str(activation_dir),
             "VLLM_MOE_TRACE_MODE": "expert_distribution",
-            "VLLM_MOE_TRACE_MAX_STEPS": str(
-                len(prompts) * (args.max_model_len + args.max_new_tokens)
-            ),
+            "VLLM_MOE_TRACE_MAX_STEPS": str(trace_max_steps),
         }
     )
 
@@ -910,7 +918,7 @@ def _plot_distributions(
     return outputs
 
 
-def collect(args: argparse.Namespace) -> None:
+def _validate_collection_args(args: argparse.Namespace) -> None:
     if args.ep_size <= 0:
         raise ValueError("--ep-size must be positive")
     if args.timeout <= 0:
@@ -923,6 +931,10 @@ def collect(args: argparse.Namespace) -> None:
         raise ValueError("--datasets must not contain duplicates")
     if args.max_model_len <= 0 or args.max_new_tokens <= 0:
         raise ValueError("--max-model-len and --max-new-tokens must be positive")
+
+
+def collect(args: argparse.Namespace) -> None:
+    _validate_collection_args(args)
     args.output_dir = args.output_dir.expanduser().resolve()
     datasets = _load_datasets(args)
     if args.ep_size > args.num_prompts:
@@ -956,6 +968,97 @@ def collect(args: argparse.Namespace) -> None:
     )
     print(f"Saved {len(outputs)} plots under {args.output_dir / 'plots'}")
     print(f"Saved aggregate data to {args.output_dir / 'expert_distribution.json'}")
+
+
+def _solve_collected_experiment(
+    args: argparse.Namespace,
+    experiment_dir: Path,
+    output_path: Path,
+) -> None:
+    repo_root = str(Path(__file__).resolve().parents[3])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from benchmarks.kernels.benchmark_deepep_ht_distribution import run_solver_only
+
+    run_solver_only(
+        argparse.Namespace(
+            trace_dir=experiment_dir,
+            trace_layer=args.solver_layer,
+            trace_step=args.solver_step,
+            top_k=None,
+            solver_world_size=args.ep_size,
+            solver_redundant_slots=args.solver_redundant_slots,
+            solver_fast_capacity_tolerance=args.solver_fast_capacity_tolerance,
+            solver_compute_weight=args.solver_compute_weight,
+            solver_communication_weight=args.solver_communication_weight,
+            solver_link_weight=args.solver_link_weight,
+            solver_remote_weight=args.solver_remote_weight,
+            solver_replica_weight=args.solver_replica_weight,
+            solver_ultraep_beta=args.solver_ultraep_beta,
+            solver_min_quota=args.solver_min_quota,
+            solver_output_json=output_path,
+        )
+    )
+
+
+def collect_solve(args: argparse.Namespace) -> None:
+    _validate_collection_args(args)
+    if args.solver_layer < 0:
+        raise ValueError("--solver-layer must be non-negative")
+    if args.solver_step is not None and args.solver_step < 0:
+        raise ValueError("--solver-step must be non-negative")
+    if args.solver_redundant_slots < 0:
+        raise ValueError("--solver-redundant-slots must be non-negative")
+    if not 0.0 <= args.solver_fast_capacity_tolerance <= 1.0:
+        raise ValueError("--solver-fast-capacity-tolerance must be in [0, 1]")
+    if args.solver_min_quota <= 0:
+        raise ValueError("--solver-min-quota must be positive")
+    if args.solver_ultraep_beta < 1.0:
+        raise ValueError("--solver-ultraep-beta must be at least 1")
+    weights = (
+        args.solver_compute_weight,
+        args.solver_communication_weight,
+        args.solver_link_weight,
+        args.solver_remote_weight,
+        args.solver_replica_weight,
+    )
+    if any(not math.isfinite(weight) or weight < 0 for weight in weights) or not any(
+        weights
+    ):
+        raise ValueError(
+            "Solver objective weights must be non-negative and not all zero"
+        )
+    datasets = _load_datasets(args)
+    if args.ep_size > args.num_prompts:
+        raise ValueError("--ep-size cannot exceed --num-prompts")
+    output_dir = args.solver_output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    trace_max_steps = (args.solver_step or 0) + 1
+    step_label = "first" if args.solver_step is None else f"{args.solver_step:06d}"
+
+    for dataset_name, prompts in datasets.items():
+        for batch_size in args.batch_sizes:
+            print(f"Collecting and solving dataset={dataset_name}, batch={batch_size}")
+            with tempfile.TemporaryDirectory(prefix="vllm_moe_collect_solve_") as raw:
+                collection_args = argparse.Namespace(**vars(args))
+                collection_args.output_dir = Path(raw)
+                collection_args.trace_max_steps = trace_max_steps
+                _collect_experiment(
+                    collection_args,
+                    dataset_name,
+                    prompts,
+                    batch_size,
+                )
+                experiment_dir = _experiment_dir(
+                    collection_args.output_dir,
+                    dataset_name,
+                    batch_size,
+                )
+                output_path = output_dir / (
+                    f"plan_{dataset_name}_batch_{batch_size:04d}_"
+                    f"layer_{args.solver_layer:04d}_step_{step_label}.json"
+                )
+                _solve_collected_experiment(args, experiment_dir, output_path)
 
 
 def plot(args: argparse.Namespace) -> None:
@@ -1003,37 +1106,65 @@ def _add_plot_filters(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    collect_parser = subparsers.add_parser("collect")
-    collect_parser.add_argument("--model", required=True)
-    collect_parser.add_argument("--output-dir", type=Path, required=True)
-    collect_parser.add_argument("--datasets", nargs="+", default=list(DEFAULT_DATASETS))
-    collect_parser.add_argument(
+def _add_collection_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--datasets", nargs="+", default=list(DEFAULT_DATASETS))
+    parser.add_argument(
         "--dataset-path",
         action="append",
         default=[],
         metavar="NAME=PATH",
         help="Override a built-in dataset or define a custom local dataset.",
     )
-    collect_parser.add_argument(
+    parser.add_argument(
         "--batch-sizes",
         type=int,
         nargs="+",
         default=[1],
         help="Prompt batch sizes per EP rank to compare.",
     )
-    collect_parser.add_argument("--num-prompts", type=int, default=32)
-    collect_parser.add_argument("--ep-size", type=int, default=1)
-    collect_parser.add_argument("--max-model-len", type=int, default=4096)
-    collect_parser.add_argument("--max-new-tokens", type=int, default=16)
-    collect_parser.add_argument("--timeout", type=int, default=1800)
-    collect_parser.add_argument("--load-format", default="auto")
-    collect_parser.add_argument("--moe-backend", default="triton")
+    parser.add_argument("--num-prompts", type=int, default=32)
+    parser.add_argument("--ep-size", type=int, default=1)
+    parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--max-new-tokens", type=int, default=16)
+    parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--load-format", default="auto")
+    parser.add_argument("--moe-backend", default="triton")
+
+
+def _add_solver_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--solver-output-dir", type=Path, required=True)
+    parser.add_argument("--solver-layer", type=int, required=True)
+    parser.add_argument(
+        "--solver-step",
+        type=int,
+        help="Raw forward step to solve; defaults to the first captured step.",
+    )
+    parser.add_argument("--solver-redundant-slots", type=int, default=2)
+    parser.add_argument("--solver-fast-capacity-tolerance", type=float, default=0.1)
+    parser.add_argument("--solver-compute-weight", type=float, default=1.0)
+    parser.add_argument("--solver-communication-weight", type=float, default=1.0)
+    parser.add_argument("--solver-link-weight", type=float, default=1.0)
+    parser.add_argument("--solver-remote-weight", type=float, default=0.1)
+    parser.add_argument("--solver-replica-weight", type=float, default=0.01)
+    parser.add_argument("--solver-ultraep-beta", type=float, default=1.01)
+    parser.add_argument("--solver-min-quota", type=int, default=1024)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    collect_parser = subparsers.add_parser("collect")
+    _add_collection_arguments(collect_parser)
+    collect_parser.add_argument("--output-dir", type=Path, required=True)
     _add_plot_filters(collect_parser)
     collect_parser.set_defaults(func=collect)
+
+    collect_solve_parser = subparsers.add_parser("collect-solve")
+    _add_collection_arguments(collect_solve_parser)
+    _add_solver_arguments(collect_solve_parser)
+    collect_solve_parser.set_defaults(func=collect_solve)
 
     plot_parser = subparsers.add_parser("plot")
     plot_parser.add_argument("--work-dir", type=Path, required=True)

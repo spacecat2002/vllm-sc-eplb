@@ -83,6 +83,37 @@ selected combinations without running inference again:
   --max-steps 100
 ```
 
+## Collect and solve without retaining traces
+
+The `collect-solve` command captures real token-level `topk_ids`, runs the fast
+placement and routing solver as soon as each dataset/batch-size experiment
+finishes, and then removes the temporary trace. Only the plan JSON files under
+`--solver-output-dir` are retained:
+
+```bash
+.venv/bin/python \
+  examples/basic/offline_inference/moe_trace_expert_distribution.py \
+  collect-solve \
+  --model Qwen/Qwen3-30B-A3B \
+  --datasets math \
+  --batch-sizes 8 \
+  --num-prompts 32 \
+  --ep-size 4 \
+  --max-new-tokens 16 \
+  --solver-layer 23 \
+  --solver-step 0 \
+  --solver-redundant-slots 2 \
+  --solver-min-quota 8 \
+  --solver-fast-capacity-tolerance 0.1 \
+  --solver-output-dir /tmp/qwen3_moe_plans
+```
+
+For this example, the retained file is
+`plan_math_batch_0008_layer_0023_step_000000.json`. Omitting `--solver-step`
+selects the first captured model-forward step. Collection stops after the
+selected step, although every MoE layer up to that point is temporarily
+captured because all layers share the same router trace hook.
+
 ## Local or custom datasets
 
 `--dataset-path NAME=PATH` accepts UTF-8 TXT, JSON, or JSONL. TXT uses one
