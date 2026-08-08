@@ -381,7 +381,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Compare the original layout, UltraEP Algorithm 1, and the "
-            "independent joint redistribution/reroute plan without CUDA or "
+            "compute-target-constrained joint redistribution/reroute plan without "
+            "CUDA or "
             "DeepEP."
         ),
     )
@@ -424,7 +425,7 @@ def parse_args() -> argparse.Namespace:
         default=16,
         help=(
             "Maximum number of routing chunks per compressed top-k group for "
-            "the independent reroute heuristic."
+            "the communication-aware reroute heuristic."
         ),
     )
     parser.add_argument(
@@ -437,7 +438,7 @@ def parse_args() -> argparse.Namespace:
         "--solver-redistribution-min-quota",
         type=int,
         default=1,
-        help="Minimum assignments that every independent-plan replica must carry.",
+        help="Minimum assignments that every communication-phase replica must carry.",
     )
     parser.add_argument(
         "--solver-compute-weight",
@@ -886,6 +887,25 @@ def _joint_route_patterns(
     return tuple(_solver_route_pattern(group, hosts, world_size) for hosts in prefixes)
 
 
+def _rank_load_target_key(
+    rank_loads: list[int], target_rank_loads: tuple[int, ...]
+) -> tuple[int, int, int, int]:
+    deviations = [
+        abs(load - target)
+        for load, target in zip(rank_loads, target_rank_loads, strict=True)
+    ]
+    overloads = [
+        max(load - target, 0)
+        for load, target in zip(rank_loads, target_rank_loads, strict=True)
+    ]
+    return (
+        max(overloads, default=0),
+        sum(overloads),
+        max(deviations, default=0),
+        sum(deviations),
+    )
+
+
 def _projected_joint_route_key(
     pattern: SolverRoutePattern,
     source: int,
@@ -896,13 +916,14 @@ def _projected_joint_route_key(
     inbound: list[int],
     remote_transfers: int,
     replica_max: int,
+    target_rank_loads: tuple[int, ...],
     world_size: int,
     args: argparse.Namespace,
 ) -> tuple[Any, ...]:
-    projected_compute = max(
+    projected_rank_loads = [
         rank_loads[rank] + pattern.rank_assignment_counts[rank] * chunk
         for rank in range(world_size)
-    )
+    ]
     projected_outbound = outbound[source] + (len(pattern.remote_destinations) * chunk)
     projected_endpoint = max(
         projected_outbound,
@@ -927,15 +948,18 @@ def _projected_joint_route_key(
         default=0,
     )
     projected_remote = remote_transfers + (len(pattern.remote_destinations) * chunk)
-    score = (
-        args.solver_compute_weight * projected_compute
-        + args.solver_communication_weight * projected_endpoint
+    communication_score = (
+        args.solver_communication_weight * projected_endpoint
         + args.solver_link_weight * projected_link
         + args.solver_remote_weight * projected_remote
         + args.solver_replica_weight * replica_max
     )
     return (
-        score,
+        *_rank_load_target_key(projected_rank_loads, target_rank_loads),
+        communication_score,
+        projected_endpoint,
+        projected_link,
+        projected_remote,
         len(pattern.remote_destinations),
         max(pattern.rank_assignment_counts),
         pattern.hosts,
@@ -1018,6 +1042,7 @@ def _solver_allocations_from_greedy_state(
 def _solver_group_pressure(
     state: SolverGreedyState,
     groups: tuple[SolverTokenGroup, ...],
+    target_rank_loads: tuple[int, ...],
     world_size: int,
     args: argparse.Namespace,
 ) -> tuple[float, ...]:
@@ -1037,7 +1062,9 @@ def _solver_group_pressure(
         group = groups[group_index]
         pattern = _solver_route_pattern(group, hosts, world_size)
         compute_pressure = args.solver_compute_weight * sum(
-            assignments * state.rank_loads[rank] / max(max_compute, 1)
+            assignments
+            * max(state.rank_loads[rank] - target_rank_loads[rank], 0)
+            / max(max_compute, 1)
             for rank, assignments in enumerate(pattern.rank_assignment_counts)
         )
         communication_pressure = (
@@ -1070,6 +1097,7 @@ def _reroute_solver_groups_incrementally(
     group_indices: tuple[int, ...],
     placements: tuple[tuple[int, int], ...],
     home_by_expert: tuple[int, ...],
+    target_rank_loads: tuple[int, ...],
     world_size: int,
     args: argparse.Namespace,
 ) -> SolverGreedyState:
@@ -1122,6 +1150,7 @@ def _reroute_solver_groups_incrementally(
                     candidate.inbound,
                     candidate.remote_transfers,
                     replica_max,
+                    target_rank_loads,
                     world_size,
                     args,
                 )
@@ -1146,6 +1175,7 @@ def _redistribution_bundles(
     limit: int,
     state: SolverGreedyState,
     group_pressures: tuple[float, ...],
+    target_rank_loads: tuple[int, ...],
 ) -> list[tuple[tuple[int, int], ...]]:
     placed = set(placements)
     used_slots = [0] * world_size
@@ -1155,9 +1185,8 @@ def _redistribution_bundles(
     endpoint_loads = [
         max(state.outbound[rank], state.inbound[rank]) for rank in range(world_size)
     ]
-    mean_compute = sum(state.rank_loads) / max(world_size, 1)
+    mean_compute = sum(target_rank_loads) / max(world_size, 1)
     mean_endpoint = sum(endpoint_loads) / max(world_size, 1)
-    max_compute = max(state.rank_loads, default=0)
     max_endpoint = max(endpoint_loads, default=0)
 
     for group_index, group in enumerate(groups):
@@ -1178,9 +1207,9 @@ def _redistribution_bundles(
                 continue
             max_bundle = min(free_slots, len(missing))
             locality = 1.5 if rank == group.source_rank else 1.0
-            compute_headroom = 1.0 + (
-                (max_compute - state.rank_loads[rank]) / max(mean_compute, 1.0)
-            )
+            compute_headroom = 1.0 + max(
+                target_rank_loads[rank] - state.rank_loads[rank], 0
+            ) / max(mean_compute, 1.0)
             endpoint_headroom = 1.0 + (
                 (max_endpoint - endpoint_loads[rank]) / max(mean_endpoint, 1.0)
             )
@@ -1239,6 +1268,27 @@ def _replicas_meet_minimum_load(
     )
 
 
+def _joint_balanced_candidate_key(
+    metrics: dict[str, Any],
+    target_rank_loads: tuple[int, ...],
+    args: argparse.Namespace,
+) -> tuple[Any, ...]:
+    communication_score = (
+        args.solver_communication_weight * metrics["max_communication_endpoint"]
+        + args.solver_link_weight * metrics["max_directed_link"]
+        + args.solver_remote_weight * metrics["remote_token_transfers"]
+        + args.solver_replica_weight * metrics["max_replica_fanout"]
+    )
+    return (
+        *_rank_load_target_key(metrics["rank_assignment_loads"], target_rank_loads),
+        communication_score,
+        metrics["max_communication_endpoint"],
+        metrics["max_directed_link"],
+        metrics["remote_token_transfers"],
+        metrics["replica_count"],
+    )
+
+
 def _joint_balanced_solver_allocations(
     groups: tuple[SolverTokenGroup, ...],
     home_by_expert: tuple[int, ...],
@@ -1249,19 +1299,38 @@ def _joint_balanced_solver_allocations(
     list[tuple[int, int]],
     dict[str, Any],
 ]:
-    placements: tuple[tuple[int, int], ...] = ()
-    allocations = _baseline_solver_allocations(
+    compute_quotas, compute_threshold = _balanced_compute_quotas(
         groups,
         home_by_expert,
         world_size,
+        args.solver_redundant_slots,
+        1.0,
+        args.solver_redistribution_min_quota,
+    )
+    allocations, compute_placements = _solver_allocations_from_quotas(
+        groups,
+        home_by_expert,
+        world_size,
+        compute_quotas,
+    )
+    placements = tuple(compute_placements)
+    fixed_compute_placements = set(placements)
+    target_rank_loads = tuple(
+        sum(row[rank] for row in compute_quotas) for rank in range(world_size)
     )
     state = _solver_greedy_state(groups, allocations, world_size)
     metrics = _solver_metrics(
         allocations,
-        [],
+        list(placements),
         home_by_expert,
         len(home_by_expert),
         world_size,
+        args,
+    )
+    initial_metrics = metrics
+    current_key = _joint_balanced_candidate_key(
+        metrics,
+        target_rank_loads,
         args,
     )
     groups_by_expert = [set() for _ in home_by_expert]
@@ -1279,7 +1348,14 @@ def _joint_balanced_solver_allocations(
         best_state = None
         best_allocations = None
         best_metrics = None
-        group_pressures = _solver_group_pressure(state, groups, world_size, args)
+        best_key = None
+        group_pressures = _solver_group_pressure(
+            state,
+            groups,
+            target_rank_loads,
+            world_size,
+            args,
+        )
         for bundle in _redistribution_bundles(
             groups,
             placements,
@@ -1289,6 +1365,7 @@ def _joint_balanced_solver_allocations(
             candidate_limit,
             state,
             group_pressures,
+            target_rank_loads,
         ):
             candidate = tuple(sorted({*placements, *bundle}))
             affected_groups = tuple(
@@ -1300,6 +1377,7 @@ def _joint_balanced_solver_allocations(
                 affected_groups,
                 candidate,
                 home_by_expert,
+                target_rank_loads,
                 world_size,
                 args,
             )
@@ -1318,27 +1396,34 @@ def _joint_balanced_solver_allocations(
             )
             evaluated += 1
             rerouted_group_visits += len(affected_groups)
-            if not _replicas_meet_minimum_load(
+            compute_replicas_are_used = _replicas_meet_minimum_load(
                 candidate_metrics,
-                candidate,
+                tuple(fixed_compute_placements),
                 args.solver_redistribution_min_quota,
                 world_size,
-            ):
+            )
+            communication_replicas_are_used = _replicas_meet_minimum_load(
+                candidate_metrics,
+                tuple(set(candidate) - fixed_compute_placements),
+                args.solver_redistribution_min_quota,
+                world_size,
+            )
+            if not compute_replicas_are_used or not communication_replicas_are_used:
                 continue
-            if (
-                best_metrics is None
-                or candidate_metrics["objective"] < best_metrics["objective"]
-            ):
+            candidate_key = _joint_balanced_candidate_key(
+                candidate_metrics,
+                target_rank_loads,
+                args,
+            )
+            if best_key is None or candidate_key < best_key:
                 best_bundle = bundle
                 best_candidate = candidate
                 best_state = candidate_state
                 best_allocations = candidate_allocations
                 best_metrics = candidate_metrics
+                best_key = candidate_key
 
-        if (
-            best_metrics is None
-            or best_metrics["objective"] >= metrics["objective"] - 1e-9
-        ):
+        if best_key is None or best_metrics is None or best_key >= current_key:
             break
         assert (
             best_bundle is not None
@@ -1351,6 +1436,7 @@ def _joint_balanced_solver_allocations(
         state = best_state
         allocations = best_allocations
         metrics = best_metrics
+        current_key = best_key
         accepted += 1
         affected_group_count = len(
             set().union(*(groups_by_expert[expert] for expert, _ in best_bundle))
@@ -1366,6 +1452,11 @@ def _joint_balanced_solver_allocations(
                 "max_communication_endpoint": metrics["max_communication_endpoint"],
                 "max_directed_link": metrics["max_directed_link"],
                 "remote_token_transfers": metrics["remote_token_transfers"],
+                "rank_target_key": list(
+                    _rank_load_target_key(
+                        metrics["rank_assignment_loads"], target_rank_loads
+                    )
+                ),
             }
         )
 
@@ -1377,6 +1468,7 @@ def _joint_balanced_solver_allocations(
             tuple(range(len(groups))),
             placements,
             home_by_expert,
+            target_rank_loads,
             world_size,
             args,
         )
@@ -1393,17 +1485,43 @@ def _joint_balanced_solver_allocations(
             world_size,
             args,
         )
-        improves_objective = final_metrics["objective"] < metrics["objective"] - 1e-9
-        replicas_are_used = _replicas_meet_minimum_load(
+        final_key = _joint_balanced_candidate_key(
             final_metrics,
-            placements,
+            target_rank_loads,
+            args,
+        )
+        improves_plan = final_key < current_key
+        compute_replicas_are_used = _replicas_meet_minimum_load(
+            final_metrics,
+            tuple(fixed_compute_placements),
             args.solver_redistribution_min_quota,
             world_size,
         )
-        if improves_objective and replicas_are_used:
+        communication_replicas_are_used = _replicas_meet_minimum_load(
+            final_metrics,
+            tuple(set(placements) - fixed_compute_placements),
+            args.solver_redistribution_min_quota,
+            world_size,
+        )
+        if (
+            improves_plan
+            and compute_replicas_are_used
+            and communication_replicas_are_used
+        ):
             allocations = final_allocations
             metrics = final_metrics
+            current_key = final_key
             final_reroute_accepted = True
+
+    final_target_key = _rank_load_target_key(
+        metrics["rank_assignment_loads"], target_rank_loads
+    )
+    if any(final_target_key):
+        raise RuntimeError(
+            "joint_balanced changed the feasible per-rank compute targets: "
+            f"target={target_rank_loads}, actual={metrics['rank_assignment_loads']}"
+        )
+    total_assignments = sum(target_rank_loads)
 
     return (
         allocations,
@@ -1411,8 +1529,32 @@ def _joint_balanced_solver_allocations(
         {
             "status": "heuristic",
             "algorithm": (
-                "independent bottleneck-priced incremental greedy bundle "
-                "redistribution and affected-group reroute"
+                "compute-target-constrained greedy bundle redistribution and "
+                "communication-aware affected-group reroute"
+            ),
+            "compute_threshold": compute_threshold,
+            "compute_target_beta": 1.0,
+            "ideal_rank_load_floor": total_assignments // world_size,
+            "ideal_rank_load_ceiling": math.ceil(total_assignments / world_size),
+            "optimization_priority": [
+                "max_rank_target_overload",
+                "total_rank_target_overload",
+                "max_rank_target_absolute_deviation",
+                "total_rank_target_absolute_deviation",
+                "weighted_communication_and_replica_cost",
+            ],
+            "target_rank_loads": list(target_rank_loads),
+            "initial_rank_loads": initial_metrics["rank_assignment_loads"],
+            "initial_rank_target_key": list(
+                _rank_load_target_key(
+                    initial_metrics["rank_assignment_loads"], target_rank_loads
+                )
+            ),
+            "final_rank_target_key": list(final_target_key),
+            "compute_target_reached": True,
+            "compute_phase_replica_count": len(compute_placements),
+            "communication_phase_replica_count": (
+                len(placements) - len(compute_placements)
             ),
             "evaluated_placement_bundles": evaluated,
             "rerouted_group_visits": rerouted_group_visits,
@@ -1429,7 +1571,7 @@ def _joint_balanced_solver_allocations(
     )
 
 
-def _ultraep_quotas(
+def _balanced_compute_quotas(
     groups: tuple[SolverTokenGroup, ...],
     home_by_expert: tuple[int, ...],
     world_size: int,
@@ -1512,22 +1654,12 @@ def _ultraep_quotas(
     return best_quotas, best_threshold
 
 
-def _ultraep_solver_allocations(
+def _solver_allocations_from_quotas(
     groups: tuple[SolverTokenGroup, ...],
     home_by_expert: tuple[int, ...],
     world_size: int,
-    redundant_slots: int,
-    beta: float,
-    min_quota: int,
-) -> tuple[list[SolverRouteAllocation], list[tuple[int, int]], int]:
-    quotas, threshold = _ultraep_quotas(
-        groups,
-        home_by_expert,
-        world_size,
-        redundant_slots,
-        beta,
-        min_quota,
-    )
+    quotas: list[list[int]],
+) -> tuple[list[SolverRouteAllocation], list[tuple[int, int]]]:
     source_expert_loads = [[0] * len(home_by_expert) for _ in range(world_size)]
     for group in groups:
         for expert in group.experts:
@@ -1556,7 +1688,7 @@ def _ultraep_solver_allocations(
                 assignments[source][target] += count
                 capacity[target] -= count
         if any(capacity):
-            raise RuntimeError(f"UltraEP reroute left unused quota for expert {expert}")
+            raise RuntimeError(f"Solver reroute left unused quota for expert {expert}")
         for source in range(world_size):
             source_target_runs[source, expert] = tuple(
                 (target, assignments[source][target])
@@ -1581,7 +1713,7 @@ def _ultraep_solver_allocations(
                 run_index = run_indices[key]
                 if run_index >= len(runs):
                     raise RuntimeError(
-                        f"UltraEP reroute exhausted assignments for {key}"
+                        f"Solver reroute exhausted assignments for {key}"
                     )
                 target, run_count = runs[run_index]
                 hosts.append(target)
@@ -1603,7 +1735,7 @@ def _ultraep_solver_allocations(
         for key, runs in source_target_runs.items()
         if runs
     ):
-        raise RuntimeError("UltraEP reroute left unconsumed assignments")
+        raise RuntimeError("Solver reroute left unconsumed assignments")
 
     allocations = []
     for (group_index, hosts), count in sorted(allocation_counts.items()):
@@ -1630,6 +1762,31 @@ def _ultraep_solver_allocations(
         for rank, quota in enumerate(row)
         if rank != home_by_expert[expert] and quota > 0
     ]
+    return allocations, placements
+
+
+def _ultraep_solver_allocations(
+    groups: tuple[SolverTokenGroup, ...],
+    home_by_expert: tuple[int, ...],
+    world_size: int,
+    redundant_slots: int,
+    beta: float,
+    min_quota: int,
+) -> tuple[list[SolverRouteAllocation], list[tuple[int, int]], int]:
+    quotas, threshold = _balanced_compute_quotas(
+        groups,
+        home_by_expert,
+        world_size,
+        redundant_slots,
+        beta,
+        min_quota,
+    )
+    allocations, placements = _solver_allocations_from_quotas(
+        groups,
+        home_by_expert,
+        world_size,
+        quotas,
+    )
     return allocations, placements, threshold
 
 
@@ -1766,7 +1923,8 @@ def _print_solver_plans(plans: list[dict[str, Any]]) -> None:
     print(
         "solver_plan status scope solve_ms objective rank_max rank_skew endpoint_max "
         "destination_skew link_max link_skew remote_transfers replicas "
-        "replica_source_fanout objective_ratio_vs_ultraep"
+        "replica_source_fanout target_overload target_l1 "
+        "objective_ratio_vs_ultraep"
     )
     ultraep = next(plan for plan in plans if plan["name"] == "ultraep")
     ultraep_objective = ultraep["metrics"]["objective"]
@@ -1781,6 +1939,9 @@ def _print_solver_plans(plans: list[dict[str, Any]]) -> None:
             if solver.get("restricted_optimum_proven")
             else "heuristic"
         )
+        target_key = solver.get("final_rank_target_key")
+        target_overload = str(target_key[0]) if target_key is not None else "-"
+        target_l1 = str(target_key[3]) if target_key is not None else "-"
         ratio = metrics["objective"] / ultraep_objective if ultraep_objective else 1.0
         print(
             f"solver_plan {plan['name']} {status} {scope} "
@@ -1794,6 +1955,7 @@ def _print_solver_plans(plans: list[dict[str, Any]]) -> None:
             f"{metrics['directed_link_max_over_mean']:.3f} "
             f"{metrics['remote_token_transfers']} "
             f"{metrics['replica_count']} {metrics['max_replica_fanout']} "
+            f"{target_overload} {target_l1} "
             f"{ratio:.3f}"
         )
 
@@ -1887,6 +2049,18 @@ def _write_solver_rank_load_plot(
                 label=label,
                 color=colors(plan_index),
             )
+        if metric == "rank_assignment_loads":
+            target_rank_loads = compared[1]["solver"].get("target_rank_loads")
+            if target_rank_loads is not None:
+                axis.plot(
+                    ranks,
+                    target_rank_loads,
+                    color="black",
+                    linestyle="--",
+                    linewidth=1.2,
+                    marker=".",
+                    label="joint_balanced compute target",
+                )
         axis.set_title(title)
         axis.set_ylabel(ylabel)
         axis.yaxis.set_major_locator(MaxNLocator(integer=True))
@@ -2026,6 +2200,11 @@ def run_solver_only(args: argparse.Namespace) -> None:
                 "This is a load proxy. Calibrate the weights with real kernel "
                 "measurements before interpreting its score as minimum latency."
             ),
+            "joint_balanced_policy": (
+                "First minimize lexicographic deviation from the feasible "
+                "per-rank compute targets, then minimize weighted communication "
+                "and replica cost without worsening that compute deviation."
+            ),
         },
         "redundant_slots_per_rank": args.solver_redundant_slots,
         "rank_load_plot": str(rank_load_plot) if rank_load_plot is not None else None,
@@ -2049,7 +2228,7 @@ def run_solver_only(args: argparse.Namespace) -> None:
                 "provide a global-optimality guarantee."
             ),
             (
-                "The independent redistribution search adds improving replica "
+                "The communication redistribution search adds improving replica "
                 "bundles monotonically; it does not swap or remove an accepted "
                 "replica in a later iteration."
             ),
@@ -2066,6 +2245,15 @@ def run_solver_only(args: argparse.Namespace) -> None:
         f"world_size={world_size} experts={num_experts} top_k={trace['top_k']} "
         f"tokens={trace['tokens']} groups={trace['route_groups']} "
         f"topk={trace['topk_provenance']}"
+    )
+    balanced_solver_metadata = joint_balanced_plan["solver"]
+    print(
+        "solver_compute_target joint_balanced "
+        f"threshold={balanced_solver_metadata['compute_threshold']} "
+        f"ideal_floor={balanced_solver_metadata['ideal_rank_load_floor']} "
+        f"ideal_ceiling={balanced_solver_metadata['ideal_rank_load_ceiling']} "
+        "rank_loads="
+        + ",".join(str(load) for load in balanced_solver_metadata["target_rank_loads"])
     )
     _print_solver_plans(plans)
     if args.solver_output_json is not None:

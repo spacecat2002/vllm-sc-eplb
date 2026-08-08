@@ -120,18 +120,27 @@ after the selected step, although every MoE layer up to that point is
 temporarily captured because all layers share the same router trace hook.
 
 Each output compares three plans with one evaluator: the original layout,
-UltraEP, and the independent `joint_balanced` redistribution/reroute heuristic.
-`joint_balanced` starts
-without replicas, tests single-expert and co-occurring top-k expert bundles,
-and prices candidates from the current compute, endpoint, and directed-link
-bottlenecks. A candidate reroutes only token groups containing its experts;
-one optional global refinement is attempted after the incremental greedy search.
-It does not use the UltraEP placement or quotas as its starting point. Increase
+UltraEP, and the `joint_balanced` redistribution/reroute heuristic.
+`joint_balanced` first runs the fast compute-threshold search and records the
+resulting assignment count on every rank as `target_rank_loads`. It then tests
+single-expert and co-occurring top-k expert bundles. Candidate routes are ordered
+first by their lexicographic deviation from those per-rank compute targets and
+then by communication and replica cost. Therefore, communication improvement
+cannot be accepted by silently worsening an already reachable compute target.
+A candidate reroutes only token groups containing its experts; one optional
+global refinement is attempted after the incremental greedy search. Increase
 `--solver-redundant-slots` when co-locating larger top-k bundles is acceptable;
 `--solver-route-slices` trades solver time for finer routing splits.
+The joint compute phase starts from the exact average lower bound and uses
+`--solver-redistribution-min-quota`; `--solver-ultraep-beta` and
+`--solver-min-quota` affect only the UltraEP comparison.
+In the printed `solver_plan` table, `target_overload` is the largest amount by
+which any rank exceeds its target and `target_l1` is the sum of absolute
+per-rank deviations. Both are expected to be zero for `joint_balanced`; plans
+without a compute target print `-`.
 Every plan JSON is accompanied by a `_rank_loads.png` figure comparing UltraEP
 and `joint_balanced` compute assignments, remote sends, and remote receives for
-every rank.
+every rank. The compute subplot also draws `target_rank_loads` as a dashed line.
 
 ## Local or custom datasets
 
