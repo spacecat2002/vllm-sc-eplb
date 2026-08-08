@@ -216,6 +216,16 @@ class SolverRouteAllocation:
     count: int
 
 
+@dataclass
+class SolverGreedyState:
+    allocation_counts: dict[tuple[int, tuple[int, ...]], int]
+    rank_loads: list[int]
+    transfer_matrix: list[list[int]]
+    outbound: list[int]
+    inbound: list[int]
+    remote_transfers: int
+
+
 def apply_model_config(args: argparse.Namespace) -> argparse.Namespace:
     config = MODEL_CONFIGS.get(args.model, DEFAULT_MOE_CONFIG)
     for name, value in config.items():
@@ -932,129 +942,199 @@ def _projected_joint_route_key(
     )
 
 
-def _route_with_joint_prices(
+def _apply_solver_greedy_allocation(
+    state: SolverGreedyState,
+    group: SolverTokenGroup,
+    pattern: SolverRoutePattern,
+    count: int,
+) -> None:
+    for rank, assignments in enumerate(pattern.rank_assignment_counts):
+        state.rank_loads[rank] += assignments * count
+    source = group.source_rank
+    transfer_count = len(pattern.remote_destinations) * count
+    state.outbound[source] += transfer_count
+    state.remote_transfers += transfer_count
+    for target in pattern.remote_destinations:
+        state.inbound[target] += count
+        state.transfer_matrix[source][target] += count
+
+
+def _solver_greedy_state(
     groups: tuple[SolverTokenGroup, ...],
+    allocations: list[SolverRouteAllocation],
+    world_size: int,
+) -> SolverGreedyState:
+    state = SolverGreedyState(
+        allocation_counts={},
+        rank_loads=[0] * world_size,
+        transfer_matrix=[[0] * world_size for _ in range(world_size)],
+        outbound=[0] * world_size,
+        inbound=[0] * world_size,
+        remote_transfers=0,
+    )
+    group_indices = {group: index for index, group in enumerate(groups)}
+    for allocation in allocations:
+        group_index = group_indices[allocation.group]
+        key = group_index, allocation.pattern.hosts
+        state.allocation_counts[key] = (
+            state.allocation_counts.get(key, 0) + allocation.count
+        )
+        _apply_solver_greedy_allocation(
+            state,
+            allocation.group,
+            allocation.pattern,
+            allocation.count,
+        )
+    return state
+
+
+def _clone_solver_greedy_state(state: SolverGreedyState) -> SolverGreedyState:
+    return SolverGreedyState(
+        allocation_counts=state.allocation_counts.copy(),
+        rank_loads=state.rank_loads.copy(),
+        transfer_matrix=[row.copy() for row in state.transfer_matrix],
+        outbound=state.outbound.copy(),
+        inbound=state.inbound.copy(),
+        remote_transfers=state.remote_transfers,
+    )
+
+
+def _solver_allocations_from_greedy_state(
+    state: SolverGreedyState,
+    groups: tuple[SolverTokenGroup, ...],
+    world_size: int,
+) -> list[SolverRouteAllocation]:
+    return [
+        SolverRouteAllocation(
+            group=groups[group_index],
+            pattern=_solver_route_pattern(groups[group_index], hosts, world_size),
+            count=count,
+        )
+        for (group_index, hosts), count in sorted(state.allocation_counts.items())
+        if count
+    ]
+
+
+def _solver_group_pressure(
+    state: SolverGreedyState,
+    groups: tuple[SolverTokenGroup, ...],
+    world_size: int,
+    args: argparse.Namespace,
+) -> tuple[float, ...]:
+    max_compute = max(state.rank_loads, default=0)
+    max_endpoint = max((*state.outbound, *state.inbound), default=0)
+    max_link = max(
+        (
+            state.transfer_matrix[source][target]
+            for source in range(world_size)
+            for target in range(world_size)
+            if source != target
+        ),
+        default=0,
+    )
+    pressures = [0.0] * len(groups)
+    for (group_index, hosts), count in state.allocation_counts.items():
+        group = groups[group_index]
+        pattern = _solver_route_pattern(group, hosts, world_size)
+        compute_pressure = args.solver_compute_weight * sum(
+            assignments * state.rank_loads[rank] / max(max_compute, 1)
+            for rank, assignments in enumerate(pattern.rank_assignment_counts)
+        )
+        communication_pressure = (
+            args.solver_communication_weight
+            * len(pattern.remote_destinations)
+            * state.outbound[group.source_rank]
+            / max(max_endpoint, 1)
+        )
+        for target in pattern.remote_destinations:
+            communication_pressure += (
+                args.solver_communication_weight
+                * state.inbound[target]
+                / max(max_endpoint, 1)
+            )
+            communication_pressure += (
+                args.solver_link_weight
+                * state.transfer_matrix[group.source_rank][target]
+                / max(max_link, 1)
+            )
+        communication_pressure += args.solver_remote_weight * len(
+            pattern.remote_destinations
+        )
+        pressures[group_index] += count * (compute_pressure + communication_pressure)
+    return tuple(pressures)
+
+
+def _reroute_solver_groups_incrementally(
+    state: SolverGreedyState,
+    groups: tuple[SolverTokenGroup, ...],
+    group_indices: tuple[int, ...],
     placements: tuple[tuple[int, int], ...],
     home_by_expert: tuple[int, ...],
     world_size: int,
     args: argparse.Namespace,
-    *,
-    route_slices: int | None = None,
-    multi_start: bool = True,
-) -> tuple[list[SolverRouteAllocation], dict[str, Any]]:
-    patterns_by_group = [
-        _joint_route_patterns(
+) -> SolverGreedyState:
+    candidate = _clone_solver_greedy_state(state)
+    affected = set(group_indices)
+    for (group_index, hosts), count in list(candidate.allocation_counts.items()):
+        if group_index not in affected:
+            continue
+        pattern = _solver_route_pattern(groups[group_index], hosts, world_size)
+        _apply_solver_greedy_allocation(
+            candidate,
+            groups[group_index],
+            pattern,
+            -count,
+        )
+        del candidate.allocation_counts[group_index, hosts]
+
+    replica_outbound = [0] * world_size
+    for expert, _ in placements:
+        replica_outbound[home_by_expert[expert]] += 1
+    replica_max = max(replica_outbound, default=0)
+    order = sorted(
+        group_indices,
+        key=lambda index: (
+            -groups[index].count,
+            groups[index].source_rank,
+            groups[index].experts,
+        ),
+    )
+    for group_index in order:
+        group = groups[group_index]
+        patterns = _joint_route_patterns(
             group,
             placements,
             home_by_expert,
             world_size,
         )
-        for group in groups
-    ]
-    replica_outbound = [0] * world_size
-    for expert, _ in placements:
-        replica_outbound[home_by_expert[expert]] += 1
-    replica_max = max(replica_outbound, default=0)
-
-    count_order = tuple(
-        sorted(
-            range(len(groups)),
-            key=lambda index: (
-                -groups[index].count,
-                groups[index].source_rank,
-                groups[index].experts,
-            ),
-        )
-    )
-    fanout_order = tuple(
-        sorted(
-            range(len(groups)),
-            key=lambda index: (
-                -groups[index].count * len(groups[index].experts),
-                groups[index].source_rank,
-                groups[index].experts,
-            ),
-        )
-    )
-    orders = (
-        tuple(dict.fromkeys((count_order, fanout_order, tuple(reversed(count_order)))))
-        if multi_start
-        else (count_order,)
-    )
-    route_slices = route_slices or args.solver_route_slices
-    best_allocations: list[SolverRouteAllocation] | None = None
-    best_metrics: dict[str, Any] | None = None
-
-    for order in orders:
-        rank_loads = [0] * world_size
-        transfer_matrix = [[0] * world_size for _ in range(world_size)]
-        outbound = [0] * world_size
-        inbound = [0] * world_size
-        remote_transfers = 0
-        allocation_counts: dict[tuple[int, tuple[int, ...]], int] = defaultdict(int)
-
-        for group_index in order:
-            group = groups[group_index]
-            patterns = patterns_by_group[group_index]
-            chunk_size = max(1, math.ceil(group.count / route_slices))
-            remaining = group.count
-            while remaining:
-                chunk = min(chunk_size, remaining)
-                pattern_keys = {
-                    pattern: _projected_joint_route_key(
-                        pattern,
-                        group.source_rank,
-                        chunk,
-                        rank_loads,
-                        transfer_matrix,
-                        outbound,
-                        inbound,
-                        remote_transfers,
-                        replica_max,
-                        world_size,
-                        args,
-                    )
-                    for pattern in patterns
-                }
-                pattern = min(patterns, key=pattern_keys.__getitem__)
-                allocation_counts[group_index, pattern.hosts] += chunk
-                for rank in range(world_size):
-                    rank_loads[rank] += pattern.rank_assignment_counts[rank] * chunk
-                source = group.source_rank
-                transfer_count = len(pattern.remote_destinations) * chunk
-                outbound[source] += transfer_count
-                remote_transfers += transfer_count
-                for target in pattern.remote_destinations:
-                    inbound[target] += chunk
-                    transfer_matrix[source][target] += chunk
-                remaining -= chunk
-
-        allocations = [
-            SolverRouteAllocation(
-                group=groups[group_index],
-                pattern=_solver_route_pattern(
-                    groups[group_index],
-                    hosts,
+        chunk_size = max(1, math.ceil(group.count / args.solver_route_slices))
+        remaining = group.count
+        while remaining:
+            chunk = min(chunk_size, remaining)
+            pattern_keys = {
+                pattern: _projected_joint_route_key(
+                    pattern,
+                    group.source_rank,
+                    chunk,
+                    candidate.rank_loads,
+                    candidate.transfer_matrix,
+                    candidate.outbound,
+                    candidate.inbound,
+                    candidate.remote_transfers,
+                    replica_max,
                     world_size,
-                ),
-                count=count,
+                    args,
+                )
+                for pattern in patterns
+            }
+            pattern = min(patterns, key=pattern_keys.__getitem__)
+            key = group_index, pattern.hosts
+            candidate.allocation_counts[key] = (
+                candidate.allocation_counts.get(key, 0) + chunk
             )
-            for (group_index, hosts), count in sorted(allocation_counts.items())
-        ]
-        metrics = _solver_metrics(
-            allocations,
-            list(placements),
-            home_by_expert,
-            len(home_by_expert),
-            world_size,
-            args,
-        )
-        if best_metrics is None or metrics["objective"] < best_metrics["objective"]:
-            best_allocations = allocations
-            best_metrics = metrics
-
-    assert best_allocations is not None and best_metrics is not None
-    return best_allocations, best_metrics
+            _apply_solver_greedy_allocation(candidate, group, pattern, chunk)
+            remaining -= chunk
+    return candidate
 
 
 def _redistribution_bundles(
@@ -1064,14 +1144,23 @@ def _redistribution_bundles(
     world_size: int,
     redundant_slots: int,
     limit: int,
+    state: SolverGreedyState,
+    group_pressures: tuple[float, ...],
 ) -> list[tuple[tuple[int, int], ...]]:
     placed = set(placements)
     used_slots = [0] * world_size
     for _, rank in placements:
         used_slots[rank] += 1
     scores: dict[tuple[tuple[int, int], ...], float] = defaultdict(float)
+    endpoint_loads = [
+        max(state.outbound[rank], state.inbound[rank]) for rank in range(world_size)
+    ]
+    mean_compute = sum(state.rank_loads) / max(world_size, 1)
+    mean_endpoint = sum(endpoint_loads) / max(world_size, 1)
+    max_compute = max(state.rank_loads, default=0)
+    max_endpoint = max(endpoint_loads, default=0)
 
-    for group in groups:
+    for group_index, group in enumerate(groups):
         for rank in range(world_size):
             free_slots = redundant_slots - used_slots[rank]
             if free_slots <= 0:
@@ -1088,12 +1177,26 @@ def _redistribution_bundles(
             if not missing:
                 continue
             max_bundle = min(free_slots, len(missing))
-            locality = 2.0 if rank == group.source_rank else 1.0
+            locality = 1.5 if rank == group.source_rank else 1.0
+            compute_headroom = 1.0 + (
+                (max_compute - state.rank_loads[rank]) / max(mean_compute, 1.0)
+            )
+            endpoint_headroom = 1.0 + (
+                (max_endpoint - endpoint_loads[rank]) / max(mean_endpoint, 1.0)
+            )
+            pressure = max(group_pressures[group_index], float(group.count))
             bundle_sizes = {*range(1, min(3, max_bundle) + 1), max_bundle}
             for size in sorted(bundle_sizes):
                 for experts in itertools.combinations(missing, size):
                     bundle = tuple((expert, rank) for expert in experts)
-                    scores[bundle] += group.count * locality * (present + size) * size
+                    scores[bundle] += (
+                        pressure
+                        * locality
+                        * compute_headroom
+                        * endpoint_headroom
+                        * (present + size)
+                        * size
+                    )
 
     def score_key(
         item: tuple[tuple[tuple[int, int], ...], float],
@@ -1147,24 +1250,36 @@ def _joint_balanced_solver_allocations(
     dict[str, Any],
 ]:
     placements: tuple[tuple[int, int], ...] = ()
-    allocations, metrics = _route_with_joint_prices(
+    allocations = _baseline_solver_allocations(
         groups,
-        placements,
         home_by_expert,
+        world_size,
+    )
+    state = _solver_greedy_state(groups, allocations, world_size)
+    metrics = _solver_metrics(
+        allocations,
+        [],
+        home_by_expert,
+        len(home_by_expert),
         world_size,
         args,
     )
+    groups_by_expert = [set() for _ in home_by_expert]
+    for group_index, group in enumerate(groups):
+        for expert in group.experts:
+            groups_by_expert[expert].add(group_index)
     evaluated = 0
-    screened = 0
+    rerouted_group_visits = 0
     accepted = 0
+    accepted_actions: list[dict[str, Any]] = []
     candidate_limit = min(12, max(4, world_size * 2))
-    refinement_limit = 3
-    screening_route_slices = min(args.solver_route_slices, 4)
     for _ in range(args.solver_redistribution_iters):
+        best_bundle = None
         best_candidate = None
+        best_state = None
         best_allocations = None
         best_metrics = None
-        screened_candidates = []
+        group_pressures = _solver_group_pressure(state, groups, world_size, args)
         for bundle in _redistribution_bundles(
             groups,
             placements,
@@ -1172,34 +1287,37 @@ def _joint_balanced_solver_allocations(
             world_size,
             args.solver_redundant_slots,
             candidate_limit,
+            state,
+            group_pressures,
         ):
             candidate = tuple(sorted({*placements, *bundle}))
-            _, screening_metrics = _route_with_joint_prices(
+            affected_groups = tuple(
+                sorted(set().union(*(groups_by_expert[expert] for expert, _ in bundle)))
+            )
+            candidate_state = _reroute_solver_groups_incrementally(
+                state,
                 groups,
+                affected_groups,
                 candidate,
                 home_by_expert,
                 world_size,
                 args,
-                route_slices=screening_route_slices,
-                multi_start=False,
             )
-            screened += 1
-            screened_candidates.append(
-                (screening_metrics["objective"], candidate, bundle)
-            )
-
-        for _, candidate, _ in heapq.nsmallest(
-            refinement_limit,
-            screened_candidates,
-        ):
-            candidate_allocations, candidate_metrics = _route_with_joint_prices(
+            candidate_allocations = _solver_allocations_from_greedy_state(
+                candidate_state,
                 groups,
-                candidate,
+                world_size,
+            )
+            candidate_metrics = _solver_metrics(
+                candidate_allocations,
+                list(candidate),
                 home_by_expert,
+                len(home_by_expert),
                 world_size,
                 args,
             )
             evaluated += 1
+            rerouted_group_visits += len(affected_groups)
             if not _replicas_meet_minimum_load(
                 candidate_metrics,
                 candidate,
@@ -1211,7 +1329,9 @@ def _joint_balanced_solver_allocations(
                 best_metrics is None
                 or candidate_metrics["objective"] < best_metrics["objective"]
             ):
+                best_bundle = bundle
                 best_candidate = candidate
+                best_state = candidate_state
                 best_allocations = candidate_allocations
                 best_metrics = candidate_metrics
 
@@ -1220,11 +1340,70 @@ def _joint_balanced_solver_allocations(
             or best_metrics["objective"] >= metrics["objective"] - 1e-9
         ):
             break
-        assert best_candidate is not None and best_allocations is not None
+        assert (
+            best_bundle is not None
+            and best_candidate is not None
+            and best_state is not None
+            and best_allocations is not None
+            and best_metrics is not None
+        )
         placements = best_candidate
+        state = best_state
         allocations = best_allocations
         metrics = best_metrics
         accepted += 1
+        affected_group_count = len(
+            set().union(*(groups_by_expert[expert] for expert, _ in best_bundle))
+        )
+        accepted_actions.append(
+            {
+                "bundle": [
+                    {"expert_id": expert, "rank": rank} for expert, rank in best_bundle
+                ],
+                "affected_groups": affected_group_count,
+                "objective": metrics["objective"],
+                "max_rank_assignments": metrics["max_rank_assignments"],
+                "max_communication_endpoint": metrics["max_communication_endpoint"],
+                "max_directed_link": metrics["max_directed_link"],
+                "remote_token_transfers": metrics["remote_token_transfers"],
+            }
+        )
+
+    final_reroute_accepted = False
+    if placements:
+        final_state = _reroute_solver_groups_incrementally(
+            state,
+            groups,
+            tuple(range(len(groups))),
+            placements,
+            home_by_expert,
+            world_size,
+            args,
+        )
+        final_allocations = _solver_allocations_from_greedy_state(
+            final_state,
+            groups,
+            world_size,
+        )
+        final_metrics = _solver_metrics(
+            final_allocations,
+            list(placements),
+            home_by_expert,
+            len(home_by_expert),
+            world_size,
+            args,
+        )
+        improves_objective = final_metrics["objective"] < metrics["objective"] - 1e-9
+        replicas_are_used = _replicas_meet_minimum_load(
+            final_metrics,
+            placements,
+            args.solver_redistribution_min_quota,
+            world_size,
+        )
+        if improves_objective and replicas_are_used:
+            allocations = final_allocations
+            metrics = final_metrics
+            final_reroute_accepted = True
 
     return (
         allocations,
@@ -1232,16 +1411,19 @@ def _joint_balanced_solver_allocations(
         {
             "status": "heuristic",
             "algorithm": (
-                "independent two-stage placement-bundle redistribution and "
-                "top-k-pattern congestion-aware reroute"
+                "independent bottleneck-priced incremental greedy bundle "
+                "redistribution and affected-group reroute"
             ),
-            "screened_placement_bundles": screened,
-            "fully_evaluated_placement_bundles": evaluated,
+            "evaluated_placement_bundles": evaluated,
+            "rerouted_group_visits": rerouted_group_visits,
+            "mean_groups_per_candidate": (
+                rerouted_group_visits / evaluated if evaluated else 0.0
+            ),
             "accepted_redistribution_steps": accepted,
+            "accepted_actions": accepted_actions,
+            "final_global_reroute_accepted": final_reroute_accepted,
             "route_slices": args.solver_route_slices,
-            "screening_route_slices": screening_route_slices,
             "candidate_bundles_per_step": candidate_limit,
-            "refined_candidates_per_step": refinement_limit,
             "minimum_replica_load": args.solver_redistribution_min_quota,
         },
     )

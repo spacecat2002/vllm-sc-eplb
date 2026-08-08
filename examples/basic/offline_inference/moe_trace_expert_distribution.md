@@ -123,9 +123,10 @@ Each output compares three plans with one evaluator: the original layout,
 UltraEP, and the independent `joint_balanced` redistribution/reroute heuristic.
 `joint_balanced` starts
 without replicas, tests single-expert and co-occurring top-k expert bundles,
-screens them with a low-cost route, and fully reroutes only the best few
-candidates in congestion-aware chunks. It does not use the UltraEP placement
-or quotas as its starting point. Increase
+and prices candidates from the current compute, endpoint, and directed-link
+bottlenecks. A candidate reroutes only token groups containing its experts;
+one optional global refinement is attempted after the incremental greedy search.
+It does not use the UltraEP placement or quotas as its starting point. Increase
 `--solver-redundant-slots` when co-locating larger top-k bundles is acceptable;
 `--solver-route-slices` trades solver time for finer routing splits.
 Every plan JSON is accompanied by a `_rank_loads.png` figure comparing UltraEP
