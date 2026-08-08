@@ -973,6 +973,7 @@ def collect(args: argparse.Namespace) -> None:
 def _solve_collected_experiment(
     args: argparse.Namespace,
     experiment_dir: Path,
+    layer: int,
     output_path: Path,
 ) -> None:
     repo_root = str(Path(__file__).resolve().parents[3])
@@ -983,7 +984,7 @@ def _solve_collected_experiment(
     run_solver_only(
         argparse.Namespace(
             trace_dir=experiment_dir,
-            trace_layer=args.solver_layer,
+            trace_layer=layer,
             trace_step=args.solver_step,
             top_k=None,
             solver_world_size=args.ep_size,
@@ -1003,8 +1004,10 @@ def _solve_collected_experiment(
 
 def collect_solve(args: argparse.Namespace) -> None:
     _validate_collection_args(args)
-    if args.solver_layer < 0:
-        raise ValueError("--solver-layer must be non-negative")
+    if len(set(args.solver_layers)) != len(args.solver_layers):
+        raise ValueError("--solver-layers must not contain duplicates")
+    if any(layer < 0 for layer in args.solver_layers):
+        raise ValueError("--solver-layers must contain non-negative layer IDs")
     if args.solver_step is not None and args.solver_step < 0:
         raise ValueError("--solver-step must be non-negative")
     if args.solver_redundant_slots < 0:
@@ -1054,11 +1057,17 @@ def collect_solve(args: argparse.Namespace) -> None:
                     dataset_name,
                     batch_size,
                 )
-                output_path = output_dir / (
-                    f"plan_{dataset_name}_batch_{batch_size:04d}_"
-                    f"layer_{args.solver_layer:04d}_step_{step_label}.json"
-                )
-                _solve_collected_experiment(args, experiment_dir, output_path)
+                for layer in args.solver_layers:
+                    output_path = output_dir / (
+                        f"plan_{dataset_name}_batch_{batch_size:04d}_"
+                        f"layer_{layer:04d}_step_{step_label}.json"
+                    )
+                    _solve_collected_experiment(
+                        args,
+                        experiment_dir,
+                        layer,
+                        output_path,
+                    )
 
 
 def plot(args: argparse.Namespace) -> None:
@@ -1134,7 +1143,15 @@ def _add_collection_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _add_solver_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--solver-output-dir", type=Path, required=True)
-    parser.add_argument("--solver-layer", type=int, required=True)
+    parser.add_argument(
+        "--solver-layers",
+        "--solver-layer",
+        dest="solver_layers",
+        type=int,
+        nargs="+",
+        required=True,
+        help="One or more MoE layer IDs to solve from the same captured step.",
+    )
     parser.add_argument(
         "--solver-step",
         type=int,

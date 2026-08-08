@@ -100,7 +100,7 @@ finishes, and then removes the temporary trace. Only the plan JSON files under
   --num-prompts 32 \
   --ep-size 4 \
   --max-new-tokens 16 \
-  --solver-layer 23 \
+  --solver-layers 3 7 11 15 23 \
   --solver-step 0 \
   --solver-redundant-slots 2 \
   --solver-min-quota 8 \
@@ -108,11 +108,13 @@ finishes, and then removes the temporary trace. Only the plan JSON files under
   --solver-output-dir /tmp/qwen3_moe_plans
 ```
 
-For this example, the retained file is
-`plan_math_batch_0008_layer_0023_step_000000.json`. Omitting `--solver-step`
-selects the first captured model-forward step. Collection stops after the
-selected step, although every MoE layer up to that point is temporarily
-captured because all layers share the same router trace hook.
+For this example, one plan is retained for every requested layer, such as
+`plan_math_batch_0008_layer_0003_step_000000.json` and
+`plan_math_batch_0008_layer_0023_step_000000.json`. The singular alias
+`--solver-layer 23` remains available for one-layer runs. Omitting
+`--solver-step` selects the first captured model-forward step. Collection stops
+after the selected step, although every MoE layer up to that point is
+temporarily captured because all layers share the same router trace hook.
 
 ## Local or custom datasets
 
