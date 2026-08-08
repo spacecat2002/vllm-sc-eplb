@@ -370,9 +370,9 @@ def parse_args() -> argparse.Namespace:
         "--solver-only",
         action="store_true",
         help=(
-            "Compare the original layout, UltraEP Algorithm 1, a fast "
-            "communication-aware quota plan, and the independent joint "
-            "redistribution/reroute plan without CUDA or DeepEP."
+            "Compare the original layout, UltraEP Algorithm 1, and the "
+            "independent joint redistribution/reroute plan without CUDA or "
+            "DeepEP."
         ),
     )
     parser.add_argument(
@@ -420,7 +420,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--solver-redistribution-iters",
         type=int,
-        default=8,
+        default=4,
         help="Maximum accepted redistribution bundle steps.",
     )
     parser.add_argument(
@@ -428,15 +428,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Minimum assignments that every independent-plan replica must carry.",
-    )
-    parser.add_argument(
-        "--solver-fast-capacity-tolerance",
-        type=float,
-        default=0.1,
-        help=(
-            "Fast planner may prefer a communication-efficient target whose "
-            "quota capacity is within this fraction of the largest candidate."
-        ),
     )
     parser.add_argument(
         "--solver-compute-weight",
@@ -487,6 +478,14 @@ def parse_args() -> argparse.Namespace:
         "--solver-output-json",
         type=Path,
         help="Write the solver plan, including compressed token routes, as JSON.",
+    )
+    parser.add_argument(
+        "--solver-output-plot",
+        type=Path,
+        help=(
+            "Write the UltraEP versus joint_balanced per-rank load plot as PNG. "
+            "Defaults beside --solver-output-json when that option is set."
+        ),
     )
     return parser.parse_args()
 
@@ -939,6 +938,9 @@ def _route_with_joint_prices(
     home_by_expert: tuple[int, ...],
     world_size: int,
     args: argparse.Namespace,
+    *,
+    route_slices: int | None = None,
+    multi_start: bool = True,
 ) -> tuple[list[SolverRouteAllocation], dict[str, Any]]:
     patterns_by_group = [
         _joint_route_patterns(
@@ -974,9 +976,12 @@ def _route_with_joint_prices(
             ),
         )
     )
-    orders = tuple(
-        dict.fromkeys((count_order, fanout_order, tuple(reversed(count_order))))
+    orders = (
+        tuple(dict.fromkeys((count_order, fanout_order, tuple(reversed(count_order)))))
+        if multi_start
+        else (count_order,)
     )
+    route_slices = route_slices or args.solver_route_slices
     best_allocations: list[SolverRouteAllocation] | None = None
     best_metrics: dict[str, Any] | None = None
 
@@ -991,7 +996,7 @@ def _route_with_joint_prices(
         for group_index in order:
             group = groups[group_index]
             patterns = patterns_by_group[group_index]
-            chunk_size = max(1, math.ceil(group.count / args.solver_route_slices))
+            chunk_size = max(1, math.ceil(group.count / route_slices))
             remaining = group.count
             while remaining:
                 chunk = min(chunk_size, remaining)
@@ -1058,6 +1063,7 @@ def _redistribution_bundles(
     home_by_expert: tuple[int, ...],
     world_size: int,
     redundant_slots: int,
+    limit: int,
 ) -> list[tuple[tuple[int, int], ...]]:
     placed = set(placements)
     used_slots = [0] * world_size
@@ -1089,15 +1095,32 @@ def _redistribution_bundles(
                     bundle = tuple((expert, rank) for expert in experts)
                     scores[bundle] += group.count * locality * (present + size) * size
 
-    limit = max(16, world_size * max(redundant_slots, 1) * 4)
-    return [
-        bundle
-        for bundle, _ in heapq.nlargest(
-            limit,
-            scores.items(),
-            key=lambda item: (item[1], tuple(reversed(item[0]))),
-        )
-    ]
+    def score_key(
+        item: tuple[tuple[tuple[int, int], ...], float],
+    ) -> tuple[Any, ...]:
+        return item[1], tuple(reversed(item[0]))
+
+    global_candidates = heapq.nlargest(limit, scores.items(), key=score_key)
+    best_by_rank: dict[int, tuple[tuple[tuple[int, int], ...], float]] = {}
+    for bundle, score in scores.items():
+        rank = bundle[0][1]
+        current = best_by_rank.get(rank)
+        if current is None or score_key((bundle, score)) > score_key(current):
+            best_by_rank[rank] = bundle, score
+    rank_candidates = heapq.nlargest(
+        min(len(best_by_rank), max(1, limit // 2)),
+        best_by_rank.values(),
+        key=score_key,
+    )
+    selected = [bundle for bundle, _ in rank_candidates]
+    selected_set = set(selected)
+    for bundle, _ in global_candidates:
+        if len(selected) >= limit:
+            break
+        if bundle not in selected_set:
+            selected.append(bundle)
+            selected_set.add(bundle)
+    return selected[:limit]
 
 
 def _replicas_meet_minimum_load(
@@ -1132,19 +1155,43 @@ def _joint_balanced_solver_allocations(
         args,
     )
     evaluated = 0
+    screened = 0
     accepted = 0
+    candidate_limit = min(12, max(4, world_size * 2))
+    refinement_limit = 3
+    screening_route_slices = min(args.solver_route_slices, 4)
     for _ in range(args.solver_redistribution_iters):
         best_candidate = None
         best_allocations = None
         best_metrics = None
+        screened_candidates = []
         for bundle in _redistribution_bundles(
             groups,
             placements,
             home_by_expert,
             world_size,
             args.solver_redundant_slots,
+            candidate_limit,
         ):
             candidate = tuple(sorted({*placements, *bundle}))
+            _, screening_metrics = _route_with_joint_prices(
+                groups,
+                candidate,
+                home_by_expert,
+                world_size,
+                args,
+                route_slices=screening_route_slices,
+                multi_start=False,
+            )
+            screened += 1
+            screened_candidates.append(
+                (screening_metrics["objective"], candidate, bundle)
+            )
+
+        for _, candidate, _ in heapq.nsmallest(
+            refinement_limit,
+            screened_candidates,
+        ):
             candidate_allocations, candidate_metrics = _route_with_joint_prices(
                 groups,
                 candidate,
@@ -1185,12 +1232,16 @@ def _joint_balanced_solver_allocations(
         {
             "status": "heuristic",
             "algorithm": (
-                "independent joint placement-bundle redistribution and "
+                "independent two-stage placement-bundle redistribution and "
                 "top-k-pattern congestion-aware reroute"
             ),
-            "evaluated_placement_bundles": evaluated,
+            "screened_placement_bundles": screened,
+            "fully_evaluated_placement_bundles": evaluated,
             "accepted_redistribution_steps": accepted,
             "route_slices": args.solver_route_slices,
+            "screening_route_slices": screening_route_slices,
+            "candidate_bundles_per_step": candidate_limit,
+            "refined_candidates_per_step": refinement_limit,
             "minimum_replica_load": args.solver_redistribution_min_quota,
         },
     )
@@ -1203,14 +1254,11 @@ def _ultraep_quotas(
     redundant_slots: int,
     beta: float,
     min_quota: int,
-    communication_args: argparse.Namespace | None = None,
 ) -> tuple[list[list[int]], int]:
     expert_loads = [0] * len(home_by_expert)
-    source_expert_loads = [[0] * len(home_by_expert) for _ in range(world_size)]
     for group in groups:
         for expert in group.experts:
             expert_loads[expert] += group.count
-            source_expert_loads[group.source_rank][expert] += group.count
     initial_rank_loads = [0] * world_size
     experts_by_home = [[] for _ in range(world_size)]
     for expert, load in enumerate(expert_loads):
@@ -1237,8 +1285,6 @@ def _ultraep_quotas(
         excess = [max(load - threshold, 0) for load in initial_rank_loads]
         slack = [max(threshold - load, 0) for load in initial_rank_loads]
         used_slots = [0] * world_size
-        estimated_incoming = [0] * world_size
-        replicas_from_home = [0] * world_size
         overloaded = sorted(range(world_size), key=lambda rank: (-excess[rank], rank))
         for source_rank in overloaded:
             experts = sorted(
@@ -1258,50 +1304,7 @@ def _ultraep_quotas(
                     ]
                     if not admissible:
                         break
-                    if communication_args is None:
-                        target_rank = max(
-                            admissible, key=lambda rank: (slack[rank], -rank)
-                        )
-                    else:
-                        capacities = {
-                            rank: min(excess[source_rank], slack[rank], capacity)
-                            for rank in admissible
-                        }
-                        largest_capacity = max(capacities.values())
-                        minimum_capacity = math.ceil(
-                            largest_capacity
-                            * (1.0 - communication_args.solver_fast_capacity_tolerance)
-                        )
-                        near_max = [
-                            rank
-                            for rank in admissible
-                            if capacities[rank] >= minimum_capacity
-                        ]
-
-                        candidate_scores = {}
-                        for rank in near_max:
-                            quota = capacities[rank]
-                            local_fill = min(quota, source_expert_loads[rank][expert])
-                            remote = quota - local_fill
-                            projected_incoming = max(
-                                max(estimated_incoming, default=0),
-                                estimated_incoming[rank] + remote,
-                            )
-                            projected_fanout = max(
-                                max(replicas_from_home, default=0),
-                                replicas_from_home[source_rank] + 1,
-                            )
-                            score = (
-                                communication_args.solver_communication_weight
-                                * projected_incoming
-                                + communication_args.solver_link_weight * remote
-                                + communication_args.solver_remote_weight * remote
-                                + communication_args.solver_replica_weight
-                                * projected_fanout
-                            )
-                            candidate_scores[rank] = (score, rank)
-
-                        target_rank = min(near_max, key=candidate_scores.__getitem__)
+                    target_rank = max(admissible, key=lambda rank: (slack[rank], -rank))
                     delta = min(excess[source_rank], slack[target_rank], capacity)
                     if delta < min_quota:
                         break
@@ -1311,12 +1314,6 @@ def _ultraep_quotas(
                     slack[target_rank] -= delta
                     capacity -= delta
                     used_slots[target_rank] += 1
-                    if communication_args is not None:
-                        local_fill = min(
-                            delta, source_expert_loads[target_rank][expert]
-                        )
-                        estimated_incoming[target_rank] += delta - local_fill
-                        replicas_from_home[source_rank] += 1
                 if not excess[source_rank]:
                     break
         return quotas if not any(excess) else None
@@ -1340,7 +1337,6 @@ def _ultraep_solver_allocations(
     redundant_slots: int,
     beta: float,
     min_quota: int,
-    communication_args: argparse.Namespace | None = None,
 ) -> tuple[list[SolverRouteAllocation], list[tuple[int, int]], int]:
     quotas, threshold = _ultraep_quotas(
         groups,
@@ -1349,7 +1345,6 @@ def _ultraep_solver_allocations(
         redundant_slots,
         beta,
         min_quota,
-        communication_args,
     )
     source_expert_loads = [[0] * len(home_by_expert) for _ in range(world_size)]
     for group in groups:
@@ -1655,13 +1650,83 @@ def _solver_plan_comparison(
     }
 
 
+def _solver_rank_load_plot_path(args: argparse.Namespace) -> Path | None:
+    output_plot = getattr(args, "solver_output_plot", None)
+    if output_plot is not None:
+        return output_plot.expanduser().resolve()
+    if args.solver_output_json is None:
+        return None
+    output_json = args.solver_output_json.expanduser().resolve()
+    return output_json.with_name(f"{output_json.stem}_rank_loads.png")
+
+
+def _write_solver_rank_load_plot(
+    plans: list[dict[str, Any]], output_path: Path
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+
+    compared = [
+        next(plan for plan in plans if plan["name"] == name)
+        for name in ("ultraep", "joint_balanced")
+    ]
+    metric_specs = (
+        ("rank_assignment_loads", "Compute assignments", "Assignments"),
+        ("outbound_remote_tokens", "Remote sends", "Token transfers"),
+        ("inbound_remote_tokens", "Remote receives", "Token transfers"),
+    )
+    world_size = len(compared[0]["metrics"]["rank_assignment_loads"])
+    ranks = list(range(world_size))
+    width = 0.38
+    figure_width = min(24.0, max(10.0, world_size * 0.6))
+    figure, axes = plt.subplots(
+        len(metric_specs),
+        1,
+        figsize=(figure_width, 9),
+        sharex=True,
+        constrained_layout=True,
+    )
+    colors = plt.get_cmap("tab10")
+    for axis, (metric, title, ylabel) in zip(axes, metric_specs):
+        for plan_index, plan in enumerate(compared):
+            metrics = plan["metrics"]
+            positions = [rank + (plan_index - 0.5) * width for rank in ranks]
+            label = (
+                f"{plan['name']} (objective={metrics['objective']:.2f}, "
+                f"replicas={metrics['replica_count']})"
+            )
+            axis.bar(
+                positions,
+                metrics[metric],
+                width=width,
+                label=label,
+                color=colors(plan_index),
+            )
+        axis.set_title(title)
+        axis.set_ylabel(ylabel)
+        axis.yaxis.set_major_locator(MaxNLocator(integer=True))
+        axis.grid(axis="y", linewidth=0.5, alpha=0.35)
+    tick_stride = max(1, math.ceil(world_size / 32))
+    tick_ranks = ranks[::tick_stride]
+    if ranks[-1] not in tick_ranks:
+        tick_ranks.append(ranks[-1])
+    axes[-1].set_xticks(tick_ranks, [str(rank) for rank in tick_ranks])
+    axes[-1].set_xlabel("Rank")
+    axes[0].legend(loc="upper right")
+    figure.suptitle("Per-rank load: UltraEP vs joint_balanced")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+
+
 def run_solver_only(args: argparse.Namespace) -> None:
     if args.solver_redundant_slots < 0:
         raise ValueError("--solver-redundant-slots must be non-negative")
     if args.solver_world_size is not None and args.solver_world_size < 2:
         raise ValueError("--solver-world-size must be at least two")
-    if not 0.0 <= args.solver_fast_capacity_tolerance <= 1.0:
-        raise ValueError("--solver-fast-capacity-tolerance must be in [0, 1]")
     if args.solver_min_quota <= 0:
         raise ValueError("--solver-min-quota must be positive")
     if args.solver_route_slices <= 0:
@@ -1706,17 +1771,6 @@ def run_solver_only(args: argparse.Namespace) -> None:
         )
     )
     ultraep_solve_ms = (time.perf_counter() - ultraep_started) * 1e3
-    joint_started = time.perf_counter()
-    joint_allocations, joint_placements, joint_threshold = _ultraep_solver_allocations(
-        groups,
-        home_by_expert,
-        world_size,
-        args.solver_redundant_slots,
-        args.solver_ultraep_beta,
-        args.solver_min_quota,
-        args,
-    )
-    joint_solve_ms = (time.perf_counter() - joint_started) * 1e3
     balanced_started = time.perf_counter()
     balanced_allocations, balanced_placements, balanced_solver = (
         _joint_balanced_solver_allocations(
@@ -1756,27 +1810,6 @@ def run_solver_only(args: argparse.Namespace) -> None:
             },
         ),
         _solver_plan_payload(
-            "joint_fast",
-            joint_allocations,
-            joint_placements,
-            home_by_expert,
-            num_experts,
-            world_size,
-            args,
-            {
-                "status": "heuristic",
-                "algorithm": (
-                    "UltraEP quota threshold with communication-aware "
-                    "replica target selection"
-                ),
-                "compute_threshold": joint_threshold,
-                "beta": args.solver_ultraep_beta,
-                "capacity_tolerance": args.solver_fast_capacity_tolerance,
-                "minimum_replica_load": args.solver_min_quota,
-                "solve_ms": joint_solve_ms,
-            },
-        ),
-        _solver_plan_payload(
             "joint_balanced",
             balanced_allocations,
             balanced_placements,
@@ -1788,10 +1821,10 @@ def run_solver_only(args: argparse.Namespace) -> None:
         ),
     ]
     ultraep_plan = next(plan for plan in plans if plan["name"] == "ultraep")
-    joint_fast_plan = next(plan for plan in plans if plan["name"] == "joint_fast")
     joint_balanced_plan = next(
         plan for plan in plans if plan["name"] == "joint_balanced"
     )
+    rank_load_plot = _solver_rank_load_plot_path(args)
     payload = {
         "trace": trace,
         "objective": {
@@ -1813,6 +1846,7 @@ def run_solver_only(args: argparse.Namespace) -> None:
             ),
         },
         "redundant_slots_per_rank": args.solver_redundant_slots,
+        "rank_load_plot": str(rank_load_plot) if rank_load_plot is not None else None,
         "limitations": [
             (
                 "Directed source-destination pairs are used as logical links; "
@@ -1829,7 +1863,7 @@ def run_solver_only(args: argparse.Namespace) -> None:
                 "preserve original expert co-occurrence."
             ),
             (
-                "The communication-aware plans are fast heuristics and do not "
+                "The reported solver plans are heuristics and do not "
                 "provide a global-optimality guarantee."
             ),
             (
@@ -1838,10 +1872,6 @@ def run_solver_only(args: argparse.Namespace) -> None:
                 "replica in a later iteration."
             ),
         ],
-        "joint_fast_vs_ultraep": _solver_plan_comparison(
-            joint_fast_plan,
-            ultraep_plan,
-        ),
         "joint_balanced_vs_ultraep": _solver_plan_comparison(
             joint_balanced_plan,
             ultraep_plan,
@@ -1863,6 +1893,9 @@ def run_solver_only(args: argparse.Namespace) -> None:
             encoding="utf-8",
         )
         print(f"Wrote solver JSON: {args.solver_output_json}")
+    if rank_load_plot is not None:
+        _write_solver_rank_load_plot(plans, rank_load_plot)
+        print(f"Wrote solver rank load plot: {rank_load_plot}")
 
 
 def _make_weighted_topk_ids(

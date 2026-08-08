@@ -88,7 +88,8 @@ selected combinations without running inference again:
 The `collect-solve` command captures real token-level `topk_ids`, runs the fast
 placement and routing solver as soon as each dataset/batch-size experiment
 finishes, and then removes the temporary trace. Only the plan JSON files under
-`--solver-output-dir` are retained:
+`--solver-output-dir` are retained. If that option is omitted, plans are written
+to `./moe_solver_plans`:
 
 ```bash
 .venv/bin/python \
@@ -105,9 +106,8 @@ finishes, and then removes the temporary trace. Only the plan JSON files under
   --solver-redundant-slots 2 \
   --solver-min-quota 8 \
   --solver-route-slices 16 \
-  --solver-redistribution-iters 8 \
+  --solver-redistribution-iters 4 \
   --solver-redistribution-min-quota 8 \
-  --solver-fast-capacity-tolerance 0.1 \
   --solver-output-dir /tmp/qwen3_moe_plans
 ```
 
@@ -119,14 +119,18 @@ For this example, one plan is retained for every requested layer, such as
 after the selected step, although every MoE layer up to that point is
 temporarily captured because all layers share the same router trace hook.
 
-Each output compares four plans with one evaluator: the original layout,
-UltraEP, the UltraEP-quota-based `joint_fast` baseline, and the independent
-`joint_balanced` redistribution/reroute heuristic. `joint_balanced` starts
+Each output compares three plans with one evaluator: the original layout,
+UltraEP, and the independent `joint_balanced` redistribution/reroute heuristic.
+`joint_balanced` starts
 without replicas, tests single-expert and co-occurring top-k expert bundles,
-and reroutes compressed token groups in congestion-aware chunks. It does not
-use the UltraEP placement or quotas as its starting point. Increase
+screens them with a low-cost route, and fully reroutes only the best few
+candidates in congestion-aware chunks. It does not use the UltraEP placement
+or quotas as its starting point. Increase
 `--solver-redundant-slots` when co-locating larger top-k bundles is acceptable;
 `--solver-route-slices` trades solver time for finer routing splits.
+Every plan JSON is accompanied by a `_rank_loads.png` figure comparing UltraEP
+and `joint_balanced` compute assignments, remote sends, and remote receives for
+every rank.
 
 ## Local or custom datasets
 

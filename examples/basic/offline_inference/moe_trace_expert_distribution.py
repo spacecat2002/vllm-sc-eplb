@@ -993,7 +993,6 @@ def _solve_collected_experiment(
             solver_route_slices=args.solver_route_slices,
             solver_redistribution_iters=args.solver_redistribution_iters,
             solver_redistribution_min_quota=args.solver_redistribution_min_quota,
-            solver_fast_capacity_tolerance=args.solver_fast_capacity_tolerance,
             solver_compute_weight=args.solver_compute_weight,
             solver_communication_weight=args.solver_communication_weight,
             solver_link_weight=args.solver_link_weight,
@@ -1002,6 +1001,9 @@ def _solve_collected_experiment(
             solver_ultraep_beta=args.solver_ultraep_beta,
             solver_min_quota=args.solver_min_quota,
             solver_output_json=output_path,
+            solver_output_plot=output_path.with_name(
+                f"{output_path.stem}_rank_loads.png"
+            ),
         )
     )
 
@@ -1016,8 +1018,6 @@ def collect_solve(args: argparse.Namespace) -> None:
         raise ValueError("--solver-step must be non-negative")
     if args.solver_redundant_slots < 0:
         raise ValueError("--solver-redundant-slots must be non-negative")
-    if not 0.0 <= args.solver_fast_capacity_tolerance <= 1.0:
-        raise ValueError("--solver-fast-capacity-tolerance must be in [0, 1]")
     if args.solver_min_quota <= 0:
         raise ValueError("--solver-min-quota must be positive")
     if args.solver_route_slices <= 0:
@@ -1152,7 +1152,15 @@ def _add_collection_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_solver_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--solver-output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--solver-output-dir",
+        type=Path,
+        default=Path("moe_solver_plans"),
+        help=(
+            "Directory for retained solver plan JSON files; defaults to "
+            "./moe_solver_plans. Temporary traces are removed after solving."
+        ),
+    )
     parser.add_argument(
         "--solver-layers",
         "--solver-layer",
@@ -1169,13 +1177,12 @@ def _add_solver_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--solver-redundant-slots", type=int, default=2)
     parser.add_argument("--solver-route-slices", type=int, default=16)
-    parser.add_argument("--solver-redistribution-iters", type=int, default=8)
+    parser.add_argument("--solver-redistribution-iters", type=int, default=4)
     parser.add_argument(
         "--solver-redistribution-min-quota",
         type=int,
         default=1,
     )
-    parser.add_argument("--solver-fast-capacity-tolerance", type=float, default=0.1)
     parser.add_argument("--solver-compute-weight", type=float, default=1.0)
     parser.add_argument("--solver-communication-weight", type=float, default=1.0)
     parser.add_argument("--solver-link-weight", type=float, default=1.0)
