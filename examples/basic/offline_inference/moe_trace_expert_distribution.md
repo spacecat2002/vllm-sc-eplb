@@ -104,6 +104,9 @@ finishes, and then removes the temporary trace. Only the plan JSON files under
   --solver-step 0 \
   --solver-redundant-slots 2 \
   --solver-min-quota 8 \
+  --solver-route-slices 16 \
+  --solver-redistribution-iters 8 \
+  --solver-redistribution-min-quota 8 \
   --solver-fast-capacity-tolerance 0.1 \
   --solver-output-dir /tmp/qwen3_moe_plans
 ```
@@ -115,6 +118,15 @@ For this example, one plan is retained for every requested layer, such as
 `--solver-step` selects the first captured model-forward step. Collection stops
 after the selected step, although every MoE layer up to that point is
 temporarily captured because all layers share the same router trace hook.
+
+Each output compares four plans with one evaluator: the original layout,
+UltraEP, the UltraEP-quota-based `joint_fast` baseline, and the independent
+`joint_balanced` redistribution/reroute heuristic. `joint_balanced` starts
+without replicas, tests single-expert and co-occurring top-k expert bundles,
+and reroutes compressed token groups in congestion-aware chunks. It does not
+use the UltraEP placement or quotas as its starting point. Increase
+`--solver-redundant-slots` when co-locating larger top-k bundles is acceptable;
+`--solver-route-slices` trades solver time for finer routing splits.
 
 ## Local or custom datasets
 

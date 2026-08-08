@@ -983,12 +983,16 @@ def _solve_collected_experiment(
 
     run_solver_only(
         argparse.Namespace(
+            solver_example=None,
             trace_dir=experiment_dir,
             trace_layer=layer,
             trace_step=args.solver_step,
             top_k=None,
             solver_world_size=args.ep_size,
             solver_redundant_slots=args.solver_redundant_slots,
+            solver_route_slices=args.solver_route_slices,
+            solver_redistribution_iters=args.solver_redistribution_iters,
+            solver_redistribution_min_quota=args.solver_redistribution_min_quota,
             solver_fast_capacity_tolerance=args.solver_fast_capacity_tolerance,
             solver_compute_weight=args.solver_compute_weight,
             solver_communication_weight=args.solver_communication_weight,
@@ -1016,6 +1020,12 @@ def collect_solve(args: argparse.Namespace) -> None:
         raise ValueError("--solver-fast-capacity-tolerance must be in [0, 1]")
     if args.solver_min_quota <= 0:
         raise ValueError("--solver-min-quota must be positive")
+    if args.solver_route_slices <= 0:
+        raise ValueError("--solver-route-slices must be positive")
+    if args.solver_redistribution_iters < 0:
+        raise ValueError("--solver-redistribution-iters must be non-negative")
+    if args.solver_redistribution_min_quota <= 0:
+        raise ValueError("--solver-redistribution-min-quota must be positive")
     if args.solver_ultraep_beta < 1.0:
         raise ValueError("--solver-ultraep-beta must be at least 1")
     weights = (
@@ -1158,6 +1168,13 @@ def _add_solver_arguments(parser: argparse.ArgumentParser) -> None:
         help="Raw forward step to solve; defaults to the first captured step.",
     )
     parser.add_argument("--solver-redundant-slots", type=int, default=2)
+    parser.add_argument("--solver-route-slices", type=int, default=16)
+    parser.add_argument("--solver-redistribution-iters", type=int, default=8)
+    parser.add_argument(
+        "--solver-redistribution-min-quota",
+        type=int,
+        default=1,
+    )
     parser.add_argument("--solver-fast-capacity-tolerance", type=float, default=0.1)
     parser.add_argument("--solver-compute-weight", type=float, default=1.0)
     parser.add_argument("--solver-communication-weight", type=float, default=1.0)

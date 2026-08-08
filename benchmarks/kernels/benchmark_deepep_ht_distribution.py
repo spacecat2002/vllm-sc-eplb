@@ -51,6 +51,13 @@ Solve one step from a captured gating trace without CUDA::
         --trace-layer 23 --trace-step 0 \
         --solver-redundant-slots 2 --solver-output-json /tmp/moe_plan.json
 
+Run the built-in co-location example without a trace::
+
+    .venv/bin/python benchmarks/kernels/benchmark_deepep_ht_distribution.py \
+        --solver-only --solver-example coalescing \
+        --solver-redundant-slots 2 --solver-min-quota 1 \
+        --solver-redistribution-min-quota 1 --solver-route-slices 100
+
 The trace directory is produced by
 ``examples/basic/offline_inference/moe_trace_expert_distribution.py collect``.
 The solver requires records containing captured ``topk_ids``; count-only
@@ -62,6 +69,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import heapq
+import itertools
 import json
 import math
 import os
@@ -362,10 +370,15 @@ def parse_args() -> argparse.Namespace:
         "--solver-only",
         action="store_true",
         help=(
-            "Compare the original layout, UltraEP Algorithm 1, and a fast "
-            "communication-aware quota plan for one captured trace step "
-            "without CUDA or DeepEP."
+            "Compare the original layout, UltraEP Algorithm 1, a fast "
+            "communication-aware quota plan, and the independent joint "
+            "redistribution/reroute plan without CUDA or DeepEP."
         ),
+    )
+    parser.add_argument(
+        "--solver-example",
+        choices=("coalescing",),
+        help="Use a built-in deterministic solver example instead of --trace-dir.",
     )
     parser.add_argument(
         "--solver-world-size",
@@ -395,6 +408,27 @@ def parse_args() -> argparse.Namespace:
         help="Raw forward step to solve; defaults to the first captured step.",
     )
     parser.add_argument("--solver-redundant-slots", type=int, default=2)
+    parser.add_argument(
+        "--solver-route-slices",
+        type=int,
+        default=16,
+        help=(
+            "Maximum number of routing chunks per compressed top-k group for "
+            "the independent reroute heuristic."
+        ),
+    )
+    parser.add_argument(
+        "--solver-redistribution-iters",
+        type=int,
+        default=8,
+        help="Maximum accepted redistribution bundle steps.",
+    )
+    parser.add_argument(
+        "--solver-redistribution-min-quota",
+        type=int,
+        default=1,
+        help="Minimum assignments that every independent-plan replica must carry.",
+    )
     parser.add_argument(
         "--solver-fast-capacity-tolerance",
         type=float,
@@ -614,6 +648,36 @@ def _load_solver_trace(
     tuple[int, ...],
     dict[str, Any],
 ]:
+    if getattr(args, "solver_example", None) == "coalescing":
+        if args.trace_dir is not None:
+            raise ValueError("--solver-example and --trace-dir are mutually exclusive")
+        if args.solver_world_size not in (None, 3):
+            raise ValueError("The coalescing example requires --solver-world-size=3")
+        groups = (
+            SolverTokenGroup(source_rank=2, experts=(0, 1), count=100),
+            SolverTokenGroup(source_rank=2, experts=(2, 3), count=50),
+        )
+        return (
+            groups,
+            (0, 0, 2, 2),
+            {
+                "trace_dir": "builtin:coalescing",
+                "model": None,
+                "layer": 0,
+                "step": 0,
+                "world_size": 3,
+                "num_experts": 4,
+                "top_k": 2,
+                "topk_provenance": "built_in_exact_topk",
+                "expert_placement_strategy": "linear",
+                "tokens": sum(group.count for group in groups),
+                "route_groups": len(groups),
+                "description": (
+                    "Two co-occurring hot experts start on rank 0; rank 2 "
+                    "originates their tokens and also has 100 local assignments."
+                ),
+            },
+        )
     if args.trace_dir is None:
         raise ValueError("--solver-only requires --trace-dir")
     if args.trace_layer is None:
@@ -734,6 +798,402 @@ def _baseline_solver_allocations(
             )
         )
     return allocations
+
+
+def _solver_route_pattern(
+    group: SolverTokenGroup,
+    hosts: tuple[int, ...],
+    world_size: int,
+) -> SolverRoutePattern:
+    rank_counts = [0] * world_size
+    for rank in hosts:
+        rank_counts[rank] += 1
+    return SolverRoutePattern(
+        hosts=hosts,
+        rank_assignment_counts=tuple(rank_counts),
+        remote_destinations=tuple(
+            rank for rank in sorted(set(hosts)) if rank != group.source_rank
+        ),
+    )
+
+
+def _retain_solver_host_prefixes(
+    group: SolverTokenGroup,
+    prefixes: list[tuple[int, ...]],
+    world_size: int,
+    limit: int,
+) -> list[tuple[int, ...]]:
+    if len(prefixes) <= limit:
+        return prefixes
+
+    def coalescing_key(hosts: tuple[int, ...]) -> tuple[Any, ...]:
+        pattern = _solver_route_pattern(group, hosts, world_size)
+        return (
+            len(pattern.remote_destinations),
+            len(set(hosts)),
+            max(pattern.rank_assignment_counts),
+            hosts,
+        )
+
+    def compute_key(hosts: tuple[int, ...]) -> tuple[Any, ...]:
+        pattern = _solver_route_pattern(group, hosts, world_size)
+        return (
+            max(pattern.rank_assignment_counts),
+            len(pattern.remote_destinations),
+            len(set(hosts)),
+            hosts,
+        )
+
+    half = max(1, limit // 2)
+    retained = set(heapq.nsmallest(half, prefixes, key=coalescing_key))
+    retained.update(heapq.nsmallest(limit - half, prefixes, key=compute_key))
+    return sorted(retained)
+
+
+def _joint_route_patterns(
+    group: SolverTokenGroup,
+    placements: tuple[tuple[int, int], ...],
+    home_by_expert: tuple[int, ...],
+    world_size: int,
+    limit: int = 64,
+) -> tuple[SolverRoutePattern, ...]:
+    replicas_by_expert: dict[int, list[int]] = defaultdict(list)
+    for expert, rank in placements:
+        replicas_by_expert[expert].append(rank)
+
+    prefixes = [()]
+    for expert in group.experts:
+        choices = sorted(
+            {home_by_expert[expert], *replicas_by_expert[expert]},
+            key=lambda rank: (rank != group.source_rank, rank),
+        )
+        prefixes = [prefix + (rank,) for prefix in prefixes for rank in choices]
+        prefixes = _retain_solver_host_prefixes(
+            group,
+            prefixes,
+            world_size,
+            limit,
+        )
+    return tuple(_solver_route_pattern(group, hosts, world_size) for hosts in prefixes)
+
+
+def _projected_joint_route_key(
+    pattern: SolverRoutePattern,
+    source: int,
+    chunk: int,
+    rank_loads: list[int],
+    transfer_matrix: list[list[int]],
+    outbound: list[int],
+    inbound: list[int],
+    remote_transfers: int,
+    replica_max: int,
+    world_size: int,
+    args: argparse.Namespace,
+) -> tuple[Any, ...]:
+    projected_compute = max(
+        rank_loads[rank] + pattern.rank_assignment_counts[rank] * chunk
+        for rank in range(world_size)
+    )
+    projected_outbound = outbound[source] + (len(pattern.remote_destinations) * chunk)
+    projected_endpoint = max(
+        projected_outbound,
+        *(outbound[rank] for rank in range(world_size) if rank != source),
+        *(
+            inbound[rank] + (chunk if rank in pattern.remote_destinations else 0)
+            for rank in range(world_size)
+        ),
+    )
+    projected_link = max(
+        (
+            transfer_matrix[source_rank][target_rank]
+            + (
+                chunk
+                if source_rank == source and target_rank in pattern.remote_destinations
+                else 0
+            )
+            for source_rank in range(world_size)
+            for target_rank in range(world_size)
+            if source_rank != target_rank
+        ),
+        default=0,
+    )
+    projected_remote = remote_transfers + (len(pattern.remote_destinations) * chunk)
+    score = (
+        args.solver_compute_weight * projected_compute
+        + args.solver_communication_weight * projected_endpoint
+        + args.solver_link_weight * projected_link
+        + args.solver_remote_weight * projected_remote
+        + args.solver_replica_weight * replica_max
+    )
+    return (
+        score,
+        len(pattern.remote_destinations),
+        max(pattern.rank_assignment_counts),
+        pattern.hosts,
+    )
+
+
+def _route_with_joint_prices(
+    groups: tuple[SolverTokenGroup, ...],
+    placements: tuple[tuple[int, int], ...],
+    home_by_expert: tuple[int, ...],
+    world_size: int,
+    args: argparse.Namespace,
+) -> tuple[list[SolverRouteAllocation], dict[str, Any]]:
+    patterns_by_group = [
+        _joint_route_patterns(
+            group,
+            placements,
+            home_by_expert,
+            world_size,
+        )
+        for group in groups
+    ]
+    replica_outbound = [0] * world_size
+    for expert, _ in placements:
+        replica_outbound[home_by_expert[expert]] += 1
+    replica_max = max(replica_outbound, default=0)
+
+    count_order = tuple(
+        sorted(
+            range(len(groups)),
+            key=lambda index: (
+                -groups[index].count,
+                groups[index].source_rank,
+                groups[index].experts,
+            ),
+        )
+    )
+    fanout_order = tuple(
+        sorted(
+            range(len(groups)),
+            key=lambda index: (
+                -groups[index].count * len(groups[index].experts),
+                groups[index].source_rank,
+                groups[index].experts,
+            ),
+        )
+    )
+    orders = tuple(
+        dict.fromkeys((count_order, fanout_order, tuple(reversed(count_order))))
+    )
+    best_allocations: list[SolverRouteAllocation] | None = None
+    best_metrics: dict[str, Any] | None = None
+
+    for order in orders:
+        rank_loads = [0] * world_size
+        transfer_matrix = [[0] * world_size for _ in range(world_size)]
+        outbound = [0] * world_size
+        inbound = [0] * world_size
+        remote_transfers = 0
+        allocation_counts: dict[tuple[int, tuple[int, ...]], int] = defaultdict(int)
+
+        for group_index in order:
+            group = groups[group_index]
+            patterns = patterns_by_group[group_index]
+            chunk_size = max(1, math.ceil(group.count / args.solver_route_slices))
+            remaining = group.count
+            while remaining:
+                chunk = min(chunk_size, remaining)
+                pattern_keys = {
+                    pattern: _projected_joint_route_key(
+                        pattern,
+                        group.source_rank,
+                        chunk,
+                        rank_loads,
+                        transfer_matrix,
+                        outbound,
+                        inbound,
+                        remote_transfers,
+                        replica_max,
+                        world_size,
+                        args,
+                    )
+                    for pattern in patterns
+                }
+                pattern = min(patterns, key=pattern_keys.__getitem__)
+                allocation_counts[group_index, pattern.hosts] += chunk
+                for rank in range(world_size):
+                    rank_loads[rank] += pattern.rank_assignment_counts[rank] * chunk
+                source = group.source_rank
+                transfer_count = len(pattern.remote_destinations) * chunk
+                outbound[source] += transfer_count
+                remote_transfers += transfer_count
+                for target in pattern.remote_destinations:
+                    inbound[target] += chunk
+                    transfer_matrix[source][target] += chunk
+                remaining -= chunk
+
+        allocations = [
+            SolverRouteAllocation(
+                group=groups[group_index],
+                pattern=_solver_route_pattern(
+                    groups[group_index],
+                    hosts,
+                    world_size,
+                ),
+                count=count,
+            )
+            for (group_index, hosts), count in sorted(allocation_counts.items())
+        ]
+        metrics = _solver_metrics(
+            allocations,
+            list(placements),
+            home_by_expert,
+            len(home_by_expert),
+            world_size,
+            args,
+        )
+        if best_metrics is None or metrics["objective"] < best_metrics["objective"]:
+            best_allocations = allocations
+            best_metrics = metrics
+
+    assert best_allocations is not None and best_metrics is not None
+    return best_allocations, best_metrics
+
+
+def _redistribution_bundles(
+    groups: tuple[SolverTokenGroup, ...],
+    placements: tuple[tuple[int, int], ...],
+    home_by_expert: tuple[int, ...],
+    world_size: int,
+    redundant_slots: int,
+) -> list[tuple[tuple[int, int], ...]]:
+    placed = set(placements)
+    used_slots = [0] * world_size
+    for _, rank in placements:
+        used_slots[rank] += 1
+    scores: dict[tuple[tuple[int, int], ...], float] = defaultdict(float)
+
+    for group in groups:
+        for rank in range(world_size):
+            free_slots = redundant_slots - used_slots[rank]
+            if free_slots <= 0:
+                continue
+            present = sum(
+                home_by_expert[expert] == rank or (expert, rank) in placed
+                for expert in group.experts
+            )
+            missing = [
+                expert
+                for expert in group.experts
+                if home_by_expert[expert] != rank and (expert, rank) not in placed
+            ]
+            if not missing:
+                continue
+            max_bundle = min(free_slots, len(missing))
+            locality = 2.0 if rank == group.source_rank else 1.0
+            bundle_sizes = {*range(1, min(3, max_bundle) + 1), max_bundle}
+            for size in sorted(bundle_sizes):
+                for experts in itertools.combinations(missing, size):
+                    bundle = tuple((expert, rank) for expert in experts)
+                    scores[bundle] += group.count * locality * (present + size) * size
+
+    limit = max(16, world_size * max(redundant_slots, 1) * 4)
+    return [
+        bundle
+        for bundle, _ in heapq.nlargest(
+            limit,
+            scores.items(),
+            key=lambda item: (item[1], tuple(reversed(item[0]))),
+        )
+    ]
+
+
+def _replicas_meet_minimum_load(
+    metrics: dict[str, Any],
+    placements: tuple[tuple[int, int], ...],
+    minimum_load: int,
+    world_size: int,
+) -> bool:
+    expert_rank_loads = metrics["expert_rank_loads"]
+    return all(
+        expert_rank_loads.get(str(expert), [0] * world_size)[rank] >= minimum_load
+        for expert, rank in placements
+    )
+
+
+def _joint_balanced_solver_allocations(
+    groups: tuple[SolverTokenGroup, ...],
+    home_by_expert: tuple[int, ...],
+    world_size: int,
+    args: argparse.Namespace,
+) -> tuple[
+    list[SolverRouteAllocation],
+    list[tuple[int, int]],
+    dict[str, Any],
+]:
+    placements: tuple[tuple[int, int], ...] = ()
+    allocations, metrics = _route_with_joint_prices(
+        groups,
+        placements,
+        home_by_expert,
+        world_size,
+        args,
+    )
+    evaluated = 0
+    accepted = 0
+    for _ in range(args.solver_redistribution_iters):
+        best_candidate = None
+        best_allocations = None
+        best_metrics = None
+        for bundle in _redistribution_bundles(
+            groups,
+            placements,
+            home_by_expert,
+            world_size,
+            args.solver_redundant_slots,
+        ):
+            candidate = tuple(sorted({*placements, *bundle}))
+            candidate_allocations, candidate_metrics = _route_with_joint_prices(
+                groups,
+                candidate,
+                home_by_expert,
+                world_size,
+                args,
+            )
+            evaluated += 1
+            if not _replicas_meet_minimum_load(
+                candidate_metrics,
+                candidate,
+                args.solver_redistribution_min_quota,
+                world_size,
+            ):
+                continue
+            if (
+                best_metrics is None
+                or candidate_metrics["objective"] < best_metrics["objective"]
+            ):
+                best_candidate = candidate
+                best_allocations = candidate_allocations
+                best_metrics = candidate_metrics
+
+        if (
+            best_metrics is None
+            or best_metrics["objective"] >= metrics["objective"] - 1e-9
+        ):
+            break
+        assert best_candidate is not None and best_allocations is not None
+        placements = best_candidate
+        allocations = best_allocations
+        metrics = best_metrics
+        accepted += 1
+
+    return (
+        allocations,
+        list(placements),
+        {
+            "status": "heuristic",
+            "algorithm": (
+                "independent joint placement-bundle redistribution and "
+                "top-k-pattern congestion-aware reroute"
+            ),
+            "evaluated_placement_bundles": evaluated,
+            "accepted_redistribution_steps": accepted,
+            "route_slices": args.solver_route_slices,
+            "minimum_replica_load": args.solver_redistribution_min_quota,
+        },
+    )
 
 
 def _ultraep_quotas(
@@ -1129,7 +1589,7 @@ def _print_solver_plans(plans: list[dict[str, Any]]) -> None:
     print(
         "solver_plan status scope solve_ms objective rank_max rank_skew endpoint_max "
         "destination_skew link_max link_skew remote_transfers replicas "
-        "replica_source_fanout versus_ultraep"
+        "replica_source_fanout objective_ratio_vs_ultraep"
     )
     ultraep = next(plan for plan in plans if plan["name"] == "ultraep")
     ultraep_objective = ultraep["metrics"]["objective"]
@@ -1161,6 +1621,40 @@ def _print_solver_plans(plans: list[dict[str, Any]]) -> None:
         )
 
 
+def _solver_plan_comparison(
+    plan: dict[str, Any], baseline: dict[str, Any]
+) -> dict[str, Any]:
+    metrics = plan["metrics"]
+    baseline_metrics = baseline["metrics"]
+    baseline_objective = baseline_metrics["objective"]
+    return {
+        "baseline": baseline["name"],
+        "comparison": plan["name"],
+        "baseline_objective": baseline_objective,
+        "comparison_objective": metrics["objective"],
+        "baseline_replica_count": baseline_metrics["replica_count"],
+        "comparison_replica_count": metrics["replica_count"],
+        "objective_delta": metrics["objective"] - baseline_objective,
+        "objective_ratio": (
+            metrics["objective"] / baseline_objective if baseline_objective else None
+        ),
+        "max_rank_assignments_delta": (
+            metrics["max_rank_assignments"] - baseline_metrics["max_rank_assignments"]
+        ),
+        "max_communication_endpoint_delta": (
+            metrics["max_communication_endpoint"]
+            - baseline_metrics["max_communication_endpoint"]
+        ),
+        "max_directed_link_delta": (
+            metrics["max_directed_link"] - baseline_metrics["max_directed_link"]
+        ),
+        "remote_token_transfers_delta": (
+            metrics["remote_token_transfers"]
+            - baseline_metrics["remote_token_transfers"]
+        ),
+    }
+
+
 def run_solver_only(args: argparse.Namespace) -> None:
     if args.solver_redundant_slots < 0:
         raise ValueError("--solver-redundant-slots must be non-negative")
@@ -1170,6 +1664,12 @@ def run_solver_only(args: argparse.Namespace) -> None:
         raise ValueError("--solver-fast-capacity-tolerance must be in [0, 1]")
     if args.solver_min_quota <= 0:
         raise ValueError("--solver-min-quota must be positive")
+    if args.solver_route_slices <= 0:
+        raise ValueError("--solver-route-slices must be positive")
+    if args.solver_redistribution_iters < 0:
+        raise ValueError("--solver-redistribution-iters must be non-negative")
+    if args.solver_redistribution_min_quota <= 0:
+        raise ValueError("--solver-redistribution-min-quota must be positive")
     if args.solver_ultraep_beta < 1.0:
         raise ValueError("--solver-ultraep-beta must be at least 1")
     weights = (
@@ -1217,6 +1717,16 @@ def run_solver_only(args: argparse.Namespace) -> None:
         args,
     )
     joint_solve_ms = (time.perf_counter() - joint_started) * 1e3
+    balanced_started = time.perf_counter()
+    balanced_allocations, balanced_placements, balanced_solver = (
+        _joint_balanced_solver_allocations(
+            groups,
+            home_by_expert,
+            world_size,
+            args,
+        )
+    )
+    balanced_solver["solve_ms"] = (time.perf_counter() - balanced_started) * 1e3
     plans = [
         _solver_plan_payload(
             "original",
@@ -1241,6 +1751,7 @@ def run_solver_only(args: argparse.Namespace) -> None:
                 "algorithm": "UltraEP Algorithm 1 quota threshold and locality",
                 "compute_threshold": ultraep_threshold,
                 "beta": args.solver_ultraep_beta,
+                "minimum_replica_load": args.solver_min_quota,
                 "solve_ms": ultraep_solve_ms,
             },
         ),
@@ -1261,13 +1772,26 @@ def run_solver_only(args: argparse.Namespace) -> None:
                 "compute_threshold": joint_threshold,
                 "beta": args.solver_ultraep_beta,
                 "capacity_tolerance": args.solver_fast_capacity_tolerance,
+                "minimum_replica_load": args.solver_min_quota,
                 "solve_ms": joint_solve_ms,
             },
         ),
+        _solver_plan_payload(
+            "joint_balanced",
+            balanced_allocations,
+            balanced_placements,
+            home_by_expert,
+            num_experts,
+            world_size,
+            args,
+            balanced_solver,
+        ),
     ]
-    joint_plan = plans[-1]
-    ultraep_metrics = plans[1]["metrics"]
-    joint_metrics = joint_plan["metrics"]
+    ultraep_plan = next(plan for plan in plans if plan["name"] == "ultraep")
+    joint_fast_plan = next(plan for plan in plans if plan["name"] == "joint_fast")
+    joint_balanced_plan = next(
+        plan for plan in plans if plan["name"] == "joint_balanced"
+    )
     payload = {
         "trace": trace,
         "objective": {
@@ -1305,36 +1829,23 @@ def run_solver_only(args: argparse.Namespace) -> None:
                 "preserve original expert co-occurrence."
             ),
             (
-                "The communication-aware plan is a fast heuristic and does not "
+                "The communication-aware plans are fast heuristics and do not "
                 "provide a global-optimality guarantee."
             ),
+            (
+                "The independent redistribution search adds improving replica "
+                "bundles monotonically; it does not swap or remove an accepted "
+                "replica in a later iteration."
+            ),
         ],
-        "joint_fast_vs_ultraep": {
-            "objective_delta": (
-                joint_metrics["objective"] - ultraep_metrics["objective"]
-            ),
-            "objective_ratio": (
-                joint_metrics["objective"] / ultraep_metrics["objective"]
-                if ultraep_metrics["objective"]
-                else None
-            ),
-            "max_rank_assignments_delta": (
-                joint_metrics["max_rank_assignments"]
-                - ultraep_metrics["max_rank_assignments"]
-            ),
-            "max_communication_endpoint_delta": (
-                joint_metrics["max_communication_endpoint"]
-                - ultraep_metrics["max_communication_endpoint"]
-            ),
-            "max_directed_link_delta": (
-                joint_metrics["max_directed_link"]
-                - ultraep_metrics["max_directed_link"]
-            ),
-            "remote_token_transfers_delta": (
-                joint_metrics["remote_token_transfers"]
-                - ultraep_metrics["remote_token_transfers"]
-            ),
-        },
+        "joint_fast_vs_ultraep": _solver_plan_comparison(
+            joint_fast_plan,
+            ultraep_plan,
+        ),
+        "joint_balanced_vs_ultraep": _solver_plan_comparison(
+            joint_balanced_plan,
+            ultraep_plan,
+        ),
         "plans": plans,
     }
     print(
